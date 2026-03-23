@@ -6,7 +6,7 @@ use pnet::util::MacAddr;
 use std::net::Ipv4Addr;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Shared builder — everything goes through here
+// Shared builder
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn build_arp_frame(
@@ -45,7 +45,6 @@ fn build_arp_frame(
 // Public packet types
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Broadcast ARP request: "who has `target_ip`? tell `sender_ip`"
 pub struct ArpRequest {
     pub target_ip: Ipv4Addr,
     pub sender_ip: Ipv4Addr,
@@ -54,11 +53,7 @@ pub struct ArpRequest {
 
 impl ArpRequest {
     pub fn new(target_ip: Ipv4Addr, sender_ip: Ipv4Addr, sender_mac: MacAddr) -> Self {
-        Self {
-            target_ip,
-            sender_ip,
-            sender_mac,
-        }
+        Self { target_ip, sender_ip, sender_mac }
     }
 
     pub fn to_bytes(&self) -> [u8; 42] {
@@ -74,8 +69,6 @@ impl ArpRequest {
     }
 }
 
-/// Gratuitous ARP: announces "I own this IP" to all neighbors.
-/// Used to claim victim IPs without periodic gateway poisoning.
 pub struct GratuitousArp {
     pub claimed_ip: Ipv4Addr,
     pub our_mac: MacAddr,
@@ -83,10 +76,7 @@ pub struct GratuitousArp {
 
 impl GratuitousArp {
     pub fn new(claimed_ip: Ipv4Addr, our_mac: MacAddr) -> Self {
-        Self {
-            claimed_ip,
-            our_mac,
-        }
+        Self { claimed_ip, our_mac }
     }
 
     pub fn to_bytes(&self) -> [u8; 42] {
@@ -96,14 +86,12 @@ impl GratuitousArp {
             ArpOperations::Reply,
             self.our_mac,
             self.claimed_ip,
-            MacAddr::zero(), // Gratuitous: target is unspecified
-            self.claimed_ip, // Gratuitous: target IP = sender IP
+            MacAddr::zero(),
+            self.claimed_ip,
         )
     }
 }
 
-/// Unicast ARP reply used to poison a target's cache.
-/// Claims that `spoofed_ip` lives at `our_mac`.
 pub struct ArpPoison {
     pub target_mac: MacAddr,
     pub target_ip: Ipv4Addr,
@@ -118,29 +106,22 @@ impl ArpPoison {
         spoofed_ip: Ipv4Addr,
         our_mac: MacAddr,
     ) -> Self {
-        Self {
-            target_mac,
-            target_ip,
-            spoofed_ip,
-            our_mac,
-        }
+        Self { target_mac, target_ip, spoofed_ip, our_mac }
     }
 
     pub fn to_bytes(&self) -> [u8; 42] {
         build_arp_frame(
-            self.target_mac, // ethernet dst  → deliver to victim
-            self.our_mac,    // ethernet src  → from us
+            self.target_mac,
+            self.our_mac,
             ArpOperations::Reply,
-            self.our_mac,    // ARP sender MAC → our MAC
-            self.spoofed_ip, // ARP sender IP  → IP we're claiming
-            self.target_mac, // ARP target MAC → victim
-            self.target_ip,  // ARP target IP  → victim
+            self.our_mac,
+            self.spoofed_ip,
+            self.target_mac,
+            self.target_ip,
         )
     }
 }
 
-/// Unicast ARP reply that restores the correct mapping after poisoning stops.
-/// Claims that `real_ip` lives at `real_mac` (the truth).
 pub struct ArpRestore {
     pub target_mac: MacAddr,
     pub target_ip: Ipv4Addr,
@@ -155,28 +136,22 @@ impl ArpRestore {
         real_ip: Ipv4Addr,
         real_mac: MacAddr,
     ) -> Self {
-        Self {
-            target_mac,
-            target_ip,
-            real_ip,
-            real_mac,
-        }
+        Self { target_mac, target_ip, real_ip, real_mac }
     }
 
     pub fn to_bytes(&self) -> [u8; 42] {
         build_arp_frame(
             self.target_mac,
-            self.real_mac, // ethernet src  → from the real owner
+            self.real_mac,
             ArpOperations::Reply,
-            self.real_mac, // ARP sender MAC → the truth
-            self.real_ip,  // ARP sender IP  → the truth
+            self.real_mac,
+            self.real_ip,
             self.target_mac,
             self.target_ip,
         )
     }
 }
 
-/// Parsed inbound ARP reply (used by the scanner receiver).
 pub struct ArpReply {
     pub sender_mac: MacAddr,
     pub sender_ip: Ipv4Addr,
@@ -207,285 +182,142 @@ impl ArpReply {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Tests for src/network/packet.rs
-//
-// Paste this #[cfg(test)] block at the bottom of src/network/packet.rs
-//
-// All tests are pure — no sockets, no root, no hardware required.
-// Every test exercises a round-trip:  build packet → inspect raw bytes via pnet
-// ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pnet::packet::Packet;
     use pnet::packet::arp::{ArpOperations, ArpPacket};
     use pnet::packet::ethernet::{EtherTypes, EthernetPacket};
-    use pnet::util::MacAddr;
-    use std::net::Ipv4Addr;
 
-    // ── Fixtures ──────────────────────────────────────────────────────────────
+    const LOCAL_MAC:   MacAddr   = MacAddr(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF);
+    const VICTIM_MAC:  MacAddr   = MacAddr(0x11, 0x22, 0x33, 0x44, 0x55, 0x66);
+    const GATEWAY_MAC: MacAddr   = MacAddr(0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01);
+    const LOCAL_IP:    Ipv4Addr  = Ipv4Addr::new(192, 168, 1, 100);
+    const VICTIM_IP:   Ipv4Addr  = Ipv4Addr::new(192, 168, 1, 10);
+    const GATEWAY_IP:  Ipv4Addr  = Ipv4Addr::new(192, 168, 1, 1);
 
-    const LOCAL_MAC: MacAddr = MacAddr(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF);
-    const VICTIM_MAC: MacAddr = MacAddr(0x11, 0x22, 0x33, 0x44, 0x55, 0x66);
-    const GATEWAY_MAC: MacAddr = MacAddr(0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01);
-
-    const LOCAL_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 1, 100);
-    const VICTIM_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 1, 10);
-    const GATEWAY_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 1, 1);
-
-    // ── Frame-size contract ───────────────────────────────────────────────────
-
-    /// Every ARP builder must produce exactly 42 bytes:
-    ///   14 (Ethernet header) + 28 (ARP payload)
-    #[test]
-    fn test_arp_request_frame_is_42_bytes() {
-        let bytes = ArpRequest::new(VICTIM_IP, LOCAL_IP, LOCAL_MAC).to_bytes();
-        assert_eq!(bytes.len(), 42);
+    // Returns the ARP payload bytes from a raw frame so callers can construct
+    // an ArpPacket with a lifetime tied to the frame, not a temporary.
+    fn arp_payload(frame: &[u8; 42]) -> &[u8] {
+        &frame[14..]
     }
 
-    #[test]
-    fn test_arp_poison_frame_is_42_bytes() {
-        let bytes = ArpPoison::new(VICTIM_MAC, VICTIM_IP, GATEWAY_IP, LOCAL_MAC).to_bytes();
-        assert_eq!(bytes.len(), 42);
+    fn arp_of(frame: &[u8; 42]) -> ArpPacket {
+        ArpPacket::new(arp_payload(frame)).unwrap()
     }
 
+    // ── Frame size: every builder must produce exactly 42 bytes ───────────────
     #[test]
-    fn test_arp_restore_frame_is_42_bytes() {
-        let bytes = ArpRestore::new(VICTIM_MAC, VICTIM_IP, GATEWAY_IP, GATEWAY_MAC).to_bytes();
-        assert_eq!(bytes.len(), 42);
+    fn test_all_builders_produce_42_bytes() {
+        assert_eq!(ArpRequest::new(VICTIM_IP, LOCAL_IP, LOCAL_MAC).to_bytes().len(), 42);
+        assert_eq!(ArpPoison::new(VICTIM_MAC, VICTIM_IP, GATEWAY_IP, LOCAL_MAC).to_bytes().len(), 42);
+        assert_eq!(ArpRestore::new(VICTIM_MAC, VICTIM_IP, GATEWAY_IP, GATEWAY_MAC).to_bytes().len(), 42);
+        assert_eq!(GratuitousArp::new(VICTIM_IP, LOCAL_MAC).to_bytes().len(), 42);
     }
 
     // ── ArpRequest ────────────────────────────────────────────────────────────
-
-    /// Broadcast ARP request: Ethernet dst must be ff:ff:ff:ff:ff:ff.
     #[test]
-    fn test_arp_request_ethernet_dst_is_broadcast() {
+    fn test_arp_request_fields() {
         let frame = ArpRequest::new(VICTIM_IP, LOCAL_IP, LOCAL_MAC).to_bytes();
         let eth = EthernetPacket::new(&frame).unwrap();
-        assert_eq!(eth.get_destination(), MacAddr::broadcast());
-    }
+        let arp = arp_of(&frame);
 
-    /// Ethernet src must be the sender's MAC.
-    #[test]
-    fn test_arp_request_ethernet_src_is_local_mac() {
-        let frame = ArpRequest::new(VICTIM_IP, LOCAL_IP, LOCAL_MAC).to_bytes();
-        let eth = EthernetPacket::new(&frame).unwrap();
-        assert_eq!(eth.get_source(), LOCAL_MAC);
-    }
-
-    /// EtherType must be 0x0806 (ARP).
-    #[test]
-    fn test_arp_request_ethertype_is_arp() {
-        let frame = ArpRequest::new(VICTIM_IP, LOCAL_IP, LOCAL_MAC).to_bytes();
-        let eth = EthernetPacket::new(&frame).unwrap();
-        assert_eq!(eth.get_ethertype(), EtherTypes::Arp);
-    }
-
-    /// ARP operation must be Request (1).
-    #[test]
-    fn test_arp_request_operation_is_request() {
-        let frame = ArpRequest::new(VICTIM_IP, LOCAL_IP, LOCAL_MAC).to_bytes();
-        let eth = EthernetPacket::new(&frame).unwrap();
-        let arp = ArpPacket::new(eth.payload()).unwrap();
-        assert_eq!(arp.get_operation(), ArpOperations::Request);
-    }
-
-    /// ARP sender fields reflect who is asking.
-    #[test]
-    fn test_arp_request_sender_fields() {
-        let frame = ArpRequest::new(VICTIM_IP, LOCAL_IP, LOCAL_MAC).to_bytes();
-        let eth = EthernetPacket::new(&frame).unwrap();
-        let arp = ArpPacket::new(eth.payload()).unwrap();
-        assert_eq!(arp.get_sender_hw_addr(), LOCAL_MAC);
+        assert_eq!(eth.get_destination(), MacAddr::broadcast(), "eth dst must be broadcast");
+        assert_eq!(eth.get_source(),      LOCAL_MAC,            "eth src must be sender MAC");
+        assert_eq!(eth.get_ethertype(),   EtherTypes::Arp,      "ethertype must be ARP");
+        assert_eq!(arp.get_operation(),   ArpOperations::Request);
+        assert_eq!(arp.get_sender_hw_addr(),    LOCAL_MAC);
         assert_eq!(arp.get_sender_proto_addr(), LOCAL_IP);
-    }
-
-    /// ARP target IP is the host we are looking for; target MAC is all-zeros.
-    #[test]
-    fn test_arp_request_target_fields() {
-        let frame = ArpRequest::new(VICTIM_IP, LOCAL_IP, LOCAL_MAC).to_bytes();
-        let eth = EthernetPacket::new(&frame).unwrap();
-        let arp = ArpPacket::new(eth.payload()).unwrap();
         assert_eq!(arp.get_target_proto_addr(), VICTIM_IP);
-        assert_eq!(arp.get_target_hw_addr(), MacAddr::zero());
+        assert_eq!(arp.get_target_hw_addr(),    MacAddr::zero(), "target MAC unknown = zero");
     }
 
     // ── ArpPoison ─────────────────────────────────────────────────────────────
-
-    /// Poison delivers to the victim — Ethernet dst must be victim MAC.
     #[test]
-    fn test_arp_poison_ethernet_dst_is_victim_mac() {
+    fn test_arp_poison_victim_direction() {
+        // "gateway IP lives at our MAC" — sent to victim
         let frame = ArpPoison::new(VICTIM_MAC, VICTIM_IP, GATEWAY_IP, LOCAL_MAC).to_bytes();
         let eth = EthernetPacket::new(&frame).unwrap();
-        assert_eq!(eth.get_destination(), VICTIM_MAC);
-    }
+        let arp = arp_of(&frame);
 
-    /// Poison appears to come from us — Ethernet src must be our MAC.
-    #[test]
-    fn test_arp_poison_ethernet_src_is_our_mac() {
-        let frame = ArpPoison::new(VICTIM_MAC, VICTIM_IP, GATEWAY_IP, LOCAL_MAC).to_bytes();
-        let eth = EthernetPacket::new(&frame).unwrap();
-        assert_eq!(eth.get_source(), LOCAL_MAC);
-    }
-
-    /// Poison is a Reply (2), not a Request.
-    #[test]
-    fn test_arp_poison_operation_is_reply() {
-        let frame = ArpPoison::new(VICTIM_MAC, VICTIM_IP, GATEWAY_IP, LOCAL_MAC).to_bytes();
-        let eth = EthernetPacket::new(&frame).unwrap();
-        let arp = ArpPacket::new(eth.payload()).unwrap();
-        assert_eq!(arp.get_operation(), ArpOperations::Reply);
-    }
-
-    /// The lie: "gateway IP lives at our MAC" — sender fields carry the spoof.
-    #[test]
-    fn test_arp_poison_sender_fields_carry_the_lie() {
-        let frame = ArpPoison::new(VICTIM_MAC, VICTIM_IP, GATEWAY_IP, LOCAL_MAC).to_bytes();
-        let eth = EthernetPacket::new(&frame).unwrap();
-        let arp = ArpPacket::new(eth.payload()).unwrap();
-        // Victim will update its cache: GATEWAY_IP → LOCAL_MAC  (the lie)
-        assert_eq!(arp.get_sender_hw_addr(), LOCAL_MAC);
+        assert_eq!(eth.get_destination(), VICTIM_MAC,          "eth dst = victim");
+        assert_eq!(eth.get_source(),      LOCAL_MAC,           "eth src = us");
+        assert_eq!(arp.get_operation(),   ArpOperations::Reply);
+        // The lie: victim will cache GATEWAY_IP → LOCAL_MAC
+        assert_eq!(arp.get_sender_hw_addr(),    LOCAL_MAC);
         assert_eq!(arp.get_sender_proto_addr(), GATEWAY_IP);
-    }
-
-    /// The target fields point at the victim so they accept the reply.
-    #[test]
-    fn test_arp_poison_target_fields_address_victim() {
-        let frame = ArpPoison::new(VICTIM_MAC, VICTIM_IP, GATEWAY_IP, LOCAL_MAC).to_bytes();
-        let eth = EthernetPacket::new(&frame).unwrap();
-        let arp = ArpPacket::new(eth.payload()).unwrap();
-        assert_eq!(arp.get_target_hw_addr(), VICTIM_MAC);
+        assert_eq!(arp.get_target_hw_addr(),    VICTIM_MAC);
         assert_eq!(arp.get_target_proto_addr(), VICTIM_IP);
     }
 
-    /// Poisoning the gateway is symmetric: sender fields point at victim IP.
     #[test]
-    fn test_arp_poison_gateway_direction_sender_fields() {
-        // "victim IP lives at our MAC" — sent to the gateway
+    fn test_arp_poison_gateway_direction() {
+        // "victim IP lives at our MAC" — sent to gateway (symmetric)
         let frame = ArpPoison::new(GATEWAY_MAC, GATEWAY_IP, VICTIM_IP, LOCAL_MAC).to_bytes();
-        let eth = EthernetPacket::new(&frame).unwrap();
-        let arp = ArpPacket::new(eth.payload()).unwrap();
-        assert_eq!(arp.get_sender_hw_addr(), LOCAL_MAC);
+        let arp = arp_of(&frame);
+
+        assert_eq!(arp.get_sender_hw_addr(),    LOCAL_MAC);
         assert_eq!(arp.get_sender_proto_addr(), VICTIM_IP);
-        assert_eq!(arp.get_target_hw_addr(), GATEWAY_MAC);
+        assert_eq!(arp.get_target_hw_addr(),    GATEWAY_MAC);
         assert_eq!(arp.get_target_proto_addr(), GATEWAY_IP);
     }
 
     // ── ArpRestore ────────────────────────────────────────────────────────────
-
-    /// Restore is also a Reply.
     #[test]
-    fn test_arp_restore_operation_is_reply() {
+    fn test_arp_restore_fields() {
+        // Undoes the poison: victim learns GATEWAY_IP → GATEWAY_MAC (truth)
         let frame = ArpRestore::new(VICTIM_MAC, VICTIM_IP, GATEWAY_IP, GATEWAY_MAC).to_bytes();
         let eth = EthernetPacket::new(&frame).unwrap();
-        let arp = ArpPacket::new(eth.payload()).unwrap();
-        assert_eq!(arp.get_operation(), ArpOperations::Reply);
+        let arp = arp_of(&frame);
+
+        assert_eq!(eth.get_destination(), VICTIM_MAC,           "eth dst = victim");
+        assert_eq!(eth.get_source(),      GATEWAY_MAC,          "eth src = real owner");
+        assert_eq!(arp.get_operation(),   ArpOperations::Reply);
+        assert_eq!(arp.get_sender_hw_addr(),    GATEWAY_MAC,    "truth: gateway MAC");
+        assert_eq!(arp.get_sender_proto_addr(), GATEWAY_IP,     "truth: gateway IP");
     }
 
-    /// Restore sender fields carry the truth: real IP at real MAC.
+    // Poison and Restore for the same addresses must differ
     #[test]
-    fn test_arp_restore_sender_fields_carry_the_truth() {
-        let frame = ArpRestore::new(VICTIM_MAC, VICTIM_IP, GATEWAY_IP, GATEWAY_MAC).to_bytes();
-        let eth = EthernetPacket::new(&frame).unwrap();
-        let arp = ArpPacket::new(eth.payload()).unwrap();
-        // Victim will update: GATEWAY_IP → GATEWAY_MAC  (the truth)
-        assert_eq!(arp.get_sender_hw_addr(), GATEWAY_MAC);
-        assert_eq!(arp.get_sender_proto_addr(), GATEWAY_IP);
-    }
-
-    /// Restore Ethernet src is the real owner's MAC, not ours.
-    #[test]
-    fn test_arp_restore_ethernet_src_is_real_owner_mac() {
-        let frame = ArpRestore::new(VICTIM_MAC, VICTIM_IP, GATEWAY_IP, GATEWAY_MAC).to_bytes();
-        let eth = EthernetPacket::new(&frame).unwrap();
-        assert_eq!(eth.get_source(), GATEWAY_MAC);
-    }
-
-    /// Restore Ethernet dst delivers to the victim.
-    #[test]
-    fn test_arp_restore_ethernet_dst_is_victim() {
-        let frame = ArpRestore::new(VICTIM_MAC, VICTIM_IP, GATEWAY_IP, GATEWAY_MAC).to_bytes();
-        let eth = EthernetPacket::new(&frame).unwrap();
-        assert_eq!(eth.get_destination(), VICTIM_MAC);
-    }
-
-    // ── ArpReply (parser) ─────────────────────────────────────────────────────
-
-    /// A well-formed ARP reply built by ArpPoison can be parsed back by ArpReply.
-    /// This is the critical round-trip: the scanner must be able to read its own
-    /// spoofed frames without choking (and in practice reads frames from victims).
-    #[test]
-    fn test_arp_reply_parses_poison_frame() {
-        let frame = ArpPoison::new(VICTIM_MAC, VICTIM_IP, GATEWAY_IP, LOCAL_MAC).to_bytes();
-        let reply = ArpReply::from_bytes(&frame);
-        assert!(
-            reply.is_some(),
-            "ArpReply should parse a valid ARP Reply frame"
-        );
-
-        let r = reply.unwrap();
-        // Sender fields in the ARP payload are what matters to the cache.
-        assert_eq!(r.sender_mac, LOCAL_MAC);
-        assert_eq!(r.sender_ip, GATEWAY_IP);
-        assert_eq!(r.target_mac, VICTIM_MAC);
-        assert_eq!(r.target_ip, VICTIM_IP);
-    }
-
-    /// A restore frame is also a Reply — ArpReply must parse it.
-    #[test]
-    fn test_arp_reply_parses_restore_frame() {
-        let frame = ArpRestore::new(VICTIM_MAC, VICTIM_IP, GATEWAY_IP, GATEWAY_MAC).to_bytes();
-        let reply = ArpReply::from_bytes(&frame);
-        assert!(reply.is_some());
-
-        let r = reply.unwrap();
-        assert_eq!(r.sender_mac, GATEWAY_MAC);
-        assert_eq!(r.sender_ip, GATEWAY_IP);
-    }
-
-    /// An ARP Request frame must NOT be parsed as a Reply.
-    #[test]
-    fn test_arp_reply_rejects_request_frame() {
-        let frame = ArpRequest::new(VICTIM_IP, LOCAL_IP, LOCAL_MAC).to_bytes();
-        let reply = ArpReply::from_bytes(&frame);
-        assert!(
-            reply.is_none(),
-            "ArpReply::from_bytes must return None for a Request frame"
-        );
-    }
-
-    /// A buffer shorter than 42 bytes must not cause a panic.
-    #[test]
-    fn test_arp_reply_rejects_short_buffer() {
-        let short = [0u8; 20];
-        assert!(ArpReply::from_bytes(&short).is_none());
-    }
-
-    /// An all-zero buffer (not ARP ethertype) must be rejected gracefully.
-    #[test]
-    fn test_arp_reply_rejects_non_arp_ethertype() {
-        let not_arp = [0u8; 42]; // ethertype bytes 12-13 are 0x0000 = not ARP
-        assert!(ArpReply::from_bytes(&not_arp).is_none());
-    }
-
-    /// An empty slice must not panic.
-    #[test]
-    fn test_arp_reply_rejects_empty_slice() {
-        assert!(ArpReply::from_bytes(&[]).is_none());
-    }
-
-    // ── Poison ↔ Restore are not the same ────────────────────────────────────
-
-    /// The bytes produced by ArpPoison and ArpRestore for the same addresses
-    /// must differ — they carry opposite sender MACs.
-    #[test]
-    fn test_poison_and_restore_produce_different_bytes() {
-        let poison = ArpPoison::new(VICTIM_MAC, VICTIM_IP, GATEWAY_IP, LOCAL_MAC).to_bytes();
+    fn test_poison_and_restore_differ() {
+        let poison  = ArpPoison::new(VICTIM_MAC, VICTIM_IP, GATEWAY_IP, LOCAL_MAC).to_bytes();
         let restore = ArpRestore::new(VICTIM_MAC, VICTIM_IP, GATEWAY_IP, GATEWAY_MAC).to_bytes();
-        assert_ne!(
-            poison, restore,
-            "Poison and Restore frames must not be identical"
-        );
+        assert_ne!(poison, restore);
+    }
+
+    // ── ArpReply parser ───────────────────────────────────────────────────────
+    #[test]
+    fn test_arp_reply_parses_valid_reply_frames() {
+        // Both Poison and Restore are Reply frames; parser must accept both
+        let poison_frame  = ArpPoison::new(VICTIM_MAC, VICTIM_IP, GATEWAY_IP, LOCAL_MAC).to_bytes();
+        let restore_frame = ArpRestore::new(VICTIM_MAC, VICTIM_IP, GATEWAY_IP, GATEWAY_MAC).to_bytes();
+
+        let r = ArpReply::from_bytes(&poison_frame).expect("poison frame must parse");
+        assert_eq!(r.sender_mac, LOCAL_MAC);
+        assert_eq!(r.sender_ip,  GATEWAY_IP);
+        assert_eq!(r.target_mac, VICTIM_MAC);
+        assert_eq!(r.target_ip,  VICTIM_IP);
+
+        let r = ArpReply::from_bytes(&restore_frame).expect("restore frame must parse");
+        assert_eq!(r.sender_mac, GATEWAY_MAC);
+        assert_eq!(r.sender_ip,  GATEWAY_IP);
+    }
+
+    #[test]
+    fn test_arp_reply_rejects_invalid_frames() {
+        // All "must return None" cases in one place
+        let request_frame = ArpRequest::new(VICTIM_IP, LOCAL_IP, LOCAL_MAC).to_bytes();
+        let cases: &[(&[u8], &str)] = &[
+            (&request_frame, "Request frame (not Reply)"),
+            (&[0u8; 20],    "too short (20 bytes)"),
+            (&[0u8; 42],    "all-zero buffer (EtherType 0x0000)"),
+            (&[],           "empty slice"),
+        ];
+        for &(data, reason) in cases {
+            assert!(
+                ArpReply::from_bytes(data).is_none(),
+                "should return None for {reason}"
+            );
+        }
     }
 }

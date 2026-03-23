@@ -42,7 +42,6 @@ impl Color {
     }
 }
 
-// Macro so you can use it like format!() but with a color
 #[macro_export]
 macro_rules! paint {
     ($color:expr, $($arg:tt)*) => {
@@ -50,54 +49,29 @@ macro_rules! paint {
     };
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Tests for src/cli/color.rs
-//
-// Paste this block at the bottom of src/cli/color.rs
-//
-// Two layers of testing:
-//   1. Compile-time assertions via `const _: () = assert!(...)` — these fire
-//      as compiler errors, before any binary is produced.
-//   2. Runtime #[test] functions — cover the same ground plus panic paths that
-//      can't be expressed as const assertions.
-// ─────────────────────────────────────────────────────────────────────────────
-
 // ── Compile-time assertions ───────────────────────────────────────────────────
-// These run during compilation.  A failure here is a *compiler error*, not a
-// test failure, so they catch regressions before `cargo test` is even invoked.
 
 const _: () = {
-    // Pure white: #FFFFFF
     let (r, g, b) = parse_hex(b"#FFFFFF");
     assert!(r == 255 && g == 255 && b == 255);
 };
-
 const _: () = {
-    // Pure black: #000000
     let (r, g, b) = parse_hex(b"#000000");
     assert!(r == 0 && g == 0 && b == 0);
 };
-
 const _: () = {
-    // Mixed case: #C792EA (the purple used in the real codebase)
     let (r, g, b) = parse_hex(b"#C792EA");
     assert!(r == 0xC7 && g == 0x92 && b == 0xEA);
 };
-
 const _: () = {
-    // Lowercase hex digits: #50c878
     let (r, g, b) = parse_hex(b"#50c878");
     assert!(r == 0x50 && g == 0xC8 && b == 0x78);
 };
-
 const _: () = {
-    // 9-byte form (#RRGGBBAA) — alpha is silently ignored
     let (r, g, b) = parse_hex(b"#FF5050FF");
     assert!(r == 0xFF && g == 0x50 && b == 0x50);
 };
-
 const _: () = {
-    // Boundary: #010203
     let (r, g, b) = parse_hex(b"#010203");
     assert!(r == 1 && g == 2 && b == 3);
 };
@@ -108,220 +82,119 @@ const _: () = {
 mod tests {
     use super::*;
 
-    // ── parse_hex — correct decoding ──────────────────────────────────────────
-
+    // ── parse_hex: correct decoding ───────────────────────────────────────────
+    // All "known good" cases in one table: (input, expected (r, g, b))
     #[test]
-    fn test_parse_hex_pure_white() {
-        assert_eq!(parse_hex(b"#FFFFFF"), (255, 255, 255));
+    fn test_parse_hex_valid_inputs() {
+        let cases: &[(&[u8], (u8, u8, u8))] = &[
+            (b"#FFFFFF", (255, 255, 255)),   // pure white
+            (b"#000000", (0, 0, 0)),         // pure black
+            (b"#FF0000", (255, 0, 0)),       // pure red
+            (b"#00FF00", (0, 255, 0)),       // pure green
+            (b"#0000FF", (0, 0, 255)),       // pure blue
+            (b"#C792EA", (0xC7, 0x92, 0xEA)), // purple used in codebase
+            (b"#50c878", (0x50, 0xC8, 0x78)), // lowercase digits
+            (b"#Ff8800", (0xFF, 0x88, 0x00)), // mixed case
+            (b"#010203", (1, 2, 3)),           // boundary nibbles
+            (b"#09AF00", (0x09, 0xAF, 0x00)), // all hex digit classes
+            (b"#1a2b3c", (0x1A, 0x2B, 0x3C)),
+        ];
+        for &(input, expected) in cases {
+            assert_eq!(
+                parse_hex(input), expected,
+                "parse_hex({}) failed", std::str::from_utf8(input).unwrap_or("?")
+            );
+        }
     }
 
+    // 9-byte form: alpha is silently discarded regardless of its value
     #[test]
-    fn test_parse_hex_pure_black() {
-        assert_eq!(parse_hex(b"#000000"), (0, 0, 0));
-    }
-
-    #[test]
-    fn test_parse_hex_pure_red() {
-        assert_eq!(parse_hex(b"#FF0000"), (255, 0, 0));
-    }
-
-    #[test]
-    fn test_parse_hex_pure_green() {
-        assert_eq!(parse_hex(b"#00FF00"), (0, 255, 0));
-    }
-
-    #[test]
-    fn test_parse_hex_pure_blue() {
-        assert_eq!(parse_hex(b"#0000FF"), (0, 0, 255));
-    }
-
-    /// The purple used throughout the real codebase.
-    #[test]
-    fn test_parse_hex_c792ea() {
-        assert_eq!(parse_hex(b"#C792EA"), (0xC7, 0x92, 0xEA));
-    }
-
-    /// Lowercase hex digits a–f must decode identically to uppercase A–F.
-    #[test]
-    fn test_parse_hex_lowercase_digits() {
-        assert_eq!(parse_hex(b"#50c878"), parse_hex(b"#50C878"));
-    }
-
-    /// Mixed case (uppercase R, lowercase g, uppercase B) must work.
-    #[test]
-    fn test_parse_hex_mixed_case() {
-        let (r, g, b) = parse_hex(b"#Ff8800");
-        assert_eq!((r, g, b), (0xFF, 0x88, 0x00));
-    }
-
-    /// The 9-byte form (#RRGGBBAA) — alpha channel is silently discarded.
-    #[test]
-    fn test_parse_hex_9_byte_form_alpha_ignored() {
-        // Same RGB regardless of alpha value
+    fn test_parse_hex_9_byte_alpha_ignored() {
         assert_eq!(parse_hex(b"#FF5050FF"), parse_hex(b"#FF5050"));
         assert_eq!(parse_hex(b"#FF505000"), parse_hex(b"#FF5050"));
     }
 
-    /// Boundary values: 0x01, 0x02, 0x03
+    // Lowercase == uppercase for the same hex digits
     #[test]
-    fn test_parse_hex_boundary_values() {
-        assert_eq!(parse_hex(b"#010203"), (1, 2, 3));
+    fn test_parse_hex_case_insensitive() {
+        assert_eq!(parse_hex(b"#50c878"), parse_hex(b"#50C878"));
     }
 
-    /// Every valid hex digit 0–9 a–f A–F decodes to the right nibble value.
+    // ── parse_hex: panic paths ────────────────────────────────────────────────
+    // All invalid inputs in one table: (input, description)
     #[test]
-    fn test_parse_hex_all_hex_digits() {
-        // Build #0123456789ABCDEF... indirectly by checking known values.
-        assert_eq!(parse_hex(b"#09AF00"), (0x09, 0xAF, 0x00));
-        assert_eq!(parse_hex(b"#1a2b3c"), (0x1A, 0x2B, 0x3C));
-    }
-
-    // ── parse_hex — panic paths ───────────────────────────────────────────────
-    //
-    // parse_hex is `const fn` and uses `assert!(..., "message")` / `panic!()`
-    // internally, so invalid input panics at runtime (and causes a compiler
-    // error if used in a const context).  We verify each panic condition with
-    // `#[should_panic]`.
-
-    /// A string shorter than 7 bytes must panic.
-    #[test]
-    #[should_panic]
-    fn test_parse_hex_too_short_panics() {
-        parse_hex(b"#FF00");
-    }
-
-    /// A string longer than 9 bytes must panic.
-    #[test]
-    #[should_panic]
-    fn test_parse_hex_too_long_panics() {
-        parse_hex(b"#FF0000AABB");
-    }
-
-    /// Exactly 8 bytes (between the valid 7 and 9) must panic.
-    #[test]
-    #[should_panic]
-    fn test_parse_hex_8_bytes_panics() {
-        parse_hex(b"#FF0000A");
-    }
-
-    /// Missing the leading '#' must panic.
-    #[test]
-    #[should_panic]
-    fn test_parse_hex_missing_hash_panics() {
-        parse_hex(b"FF0000"); // 6 bytes, no '#'
-    }
-
-    /// A '#' at position 0 but wrong length must still panic on the length
-    /// check before reaching the digit parsing.
-    #[test]
-    #[should_panic]
-    fn test_parse_hex_hash_but_wrong_length_panics() {
-        parse_hex(b"#FF");
-    }
-
-    /// An invalid hex character ('G') must panic.
-    #[test]
-    #[should_panic]
-    fn test_parse_hex_invalid_hex_char_panics() {
-        parse_hex(b"#GG0000");
-    }
-
-    /// A space character in the hex digits must panic.
-    #[test]
-    #[should_panic]
-    fn test_parse_hex_space_in_digits_panics() {
-        parse_hex(b"#FF 000");
+    fn test_parse_hex_invalid_inputs_panic() {
+        // Each closure must panic; we verify this with catch_unwind.
+        let bad_inputs: &[&[u8]] = &[
+            b"#FF00",      // too short (5 bytes)
+            b"#FF0000AABB", // too long (11 bytes)
+            b"#FF0000A",   // 8 bytes — neither 7 nor 9
+            b"FF0000",     // missing '#'
+            b"#FF",        // '#' present but wrong length
+            b"#GG0000",    // invalid hex char 'G'
+            b"#FF 000",    // space in digits
+        ];
+        for &input in bad_inputs {
+            let result = std::panic::catch_unwind(|| parse_hex(input));
+            assert!(
+                result.is_err(),
+                "'{}' should panic but did not",
+                std::str::from_utf8(input).unwrap_or("<binary>")
+            );
+        }
     }
 
     // ── Color::paint ──────────────────────────────────────────────────────────
-
-    /// paint() must wrap text in the correct ANSI true-color escape sequence.
-    /// Format: ESC[38;2;R;G;Bm<text>ESC[0m
     #[test]
-    fn test_color_paint_ansi_format() {
-        let color = Color(255, 128, 0);
-        let result = color.paint("hello");
-        assert_eq!(result, "\x1b[38;2;255;128;0mhello\x1b[0m");
+    fn test_paint_ansi_escape_format() {
+        // Verifies the exact ANSI true-color escape sequence structure.
+        let cases: &[(u8, u8, u8, &str, &str)] = &[
+            (255, 128,   0, "hello", "\x1b[38;2;255;128;0mhello\x1b[0m"),
+            (  0,   0,   0, "x",     "\x1b[38;2;0;0;0mx\x1b[0m"),
+            (255, 255, 255, "y",     "\x1b[38;2;255;255;255my\x1b[0m"),
+            (  0,   0,   0, "",      "\x1b[38;2;0;0;0m\x1b[0m"),   // empty text
+        ];
+        for &(r, g, b, text, expected) in cases {
+            assert_eq!(Color(r, g, b).paint(text), expected);
+        }
     }
 
-    /// paint() with pure black (0,0,0).
     #[test]
-    fn test_color_paint_black() {
-        let color = Color(0, 0, 0);
-        let result = color.paint("x");
-        assert_eq!(result, "\x1b[38;2;0;0;0mx\x1b[0m");
-    }
-
-    /// paint() with pure white (255,255,255).
-    #[test]
-    fn test_color_paint_white() {
-        let color = Color(255, 255, 255);
-        let result = color.paint("y");
-        assert_eq!(result, "\x1b[38;2;255;255;255my\x1b[0m");
-    }
-
-    /// paint() with an empty string — escape sequences still wrap it.
-    #[test]
-    fn test_color_paint_empty_string() {
-        let color = Color(100, 100, 100);
-        let result = color.paint("");
-        assert_eq!(result, "\x1b[38;2;100;100;100m\x1b[0m");
-    }
-
-    /// paint() always ends with the reset sequence \x1b[0m.
-    #[test]
-    fn test_color_paint_always_resets() {
+    fn test_paint_always_wraps_with_reset() {
+        // Structural invariants that hold for any color/text combination.
         let color = Color(1, 2, 3);
-        assert!(color.paint("text").ends_with("\x1b[0m"));
-    }
-
-    /// paint() always starts with \x1b[38;2;.
-    #[test]
-    fn test_color_paint_starts_with_true_color_prefix() {
-        let color = Color(1, 2, 3);
-        assert!(color.paint("text").starts_with("\x1b[38;2;"));
-    }
-
-    /// The painted text appears literally between the opening and closing escape.
-    #[test]
-    fn test_color_paint_text_is_preserved() {
-        let color = Color(0, 0, 0);
         let painted = color.paint("Harbor");
+        assert!(painted.starts_with("\x1b[38;2;"));
+        assert!(painted.ends_with("\x1b[0m"));
         assert!(painted.contains("Harbor"));
     }
 
     // ── Color::from_hex ───────────────────────────────────────────────────────
-
-    /// from_hex is a const-fn wrapper around parse_hex — verify it stores
-    /// the parsed bytes correctly in the Color struct.
     #[test]
-    fn test_color_from_hex_stores_correct_bytes() {
-        let c = Color::from_hex(b"#C792EA");
-        assert_eq!((c.0, c.1, c.2), (0xC7, 0x92, 0xEA));
-    }
-
-    #[test]
-    fn test_color_from_hex_black() {
-        let c = Color::from_hex(b"#000000");
-        assert_eq!((c.0, c.1, c.2), (0, 0, 0));
+    fn test_from_hex_stores_parsed_bytes() {
+        let cases: &[(&[u8], (u8, u8, u8))] = &[
+            (b"#C792EA", (0xC7, 0x92, 0xEA)),
+            (b"#000000", (0, 0, 0)),
+        ];
+        for &(input, (er, eg, eb)) in cases {
+            let c = Color::from_hex(input);
+            assert_eq!((c.0, c.1, c.2), (er, eg, eb));
+        }
     }
 
     // ── paint! macro ──────────────────────────────────────────────────────────
-
-    /// The paint! macro must produce the same output as calling paint_fmt
-    /// with the equivalent format string.
     #[test]
-    fn test_paint_macro_matches_direct_paint() {
+    fn test_paint_macro() {
         let color = Color(80, 200, 120);
-        let via_macro = crate::paint!(&color, "value: {}", 42);
-        let via_method = color.paint("value: 42");
-        assert_eq!(via_macro, via_method);
-    }
 
-    #[test]
-    fn test_paint_macro_with_multiple_args() {
-        let color = Color(255, 0, 0);
-        let result = crate::paint!(&color, "{} + {} = {}", 1, 2, 3);
+        // Output matches direct paint() with equivalent format string
+        assert_eq!(
+            crate::paint!(&color, "value: {}", 42),
+            color.paint("value: 42")
+        );
+
+        // Structural invariants still hold through the macro
+        let result = crate::paint!(&Color(255, 0, 0), "{} + {} = {}", 1, 2, 3);
         assert!(result.contains("1 + 2 = 3"));
         assert!(result.starts_with("\x1b[38;2;"));
         assert!(result.ends_with("\x1b[0m"));

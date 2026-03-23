@@ -235,42 +235,84 @@ impl PoisonLoop {
     //     }
     // }
 
+
     async fn restore(
         &self,
         target: &super::SpoofTarget,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         println!("[*] restoring ARP caches for {}", target.victim_ip);
-
-        // Victim restoration (unchanged)
+ 
+        // Tell victim the truth: "gateway_ip is at gateway_mac"
         let victim_restore = ArpRestore::new(
             target.victim_mac,
             target.victim_ip,
             target.gateway_ip,
             target.gateway_mac,
         );
-
-        // Gateway restoration: re-announce correct mapping
-        let gateway_restore_garp = GratuitousArp::new(
+ 
+        // Tell gateway the truth: "victim_ip is at victim_mac"
+        // Unicast to gateway_mac — only the gateway updates its cache,
+        // no broadcast that could confuse the switch's MAC table on teardown.
+        let gateway_restore = ArpRestore::new(
+            target.gateway_mac,
+            target.gateway_ip,
             target.victim_ip,
-            target.victim_mac, // ← Real victim MAC now
+            target.victim_mac,
         );
-
+ 
         let mut sender = self.sender.lock().await;
         for _ in 0..5 {
             if let Some(Err(e)) = sender.send_to(&victim_restore.to_bytes(), None) {
                 eprintln!("[!] restore victim: {e}");
             }
-            if let Some(Err(e)) = sender.send_to(&gateway_restore_garp.to_bytes(), None) {
+            if let Some(Err(e)) = sender.send_to(&gateway_restore.to_bytes(), None) {
                 eprintln!("[!] restore gateway: {e}");
             }
             drop(sender);
             tokio::time::sleep(Duration::from_millis(100)).await;
             sender = self.sender.lock().await;
         }
-
+ 
         println!("[+] ARP caches restored for {}", target.victim_ip);
         Ok(())
     }
+
+    // async fn restore(
+    //     &self,
+    //     target: &super::SpoofTarget,
+    // ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    //     println!("[*] restoring ARP caches for {}", target.victim_ip);
+
+    //     // Victim restoration (unchanged)
+    //     let victim_restore = ArpRestore::new(
+    //         target.victim_mac,
+    //         target.victim_ip,
+    //         target.gateway_ip,
+    //         target.gateway_mac,
+    //     );
+
+    //     // Gateway restoration: re-announce correct mapping
+    //     let gateway_restore_garp = GratuitousArp::new(
+    //         target.victim_ip,
+    //         target.victim_mac, // ← Real victim MAC now
+    //     );
+
+    //     let mut sender = self.sender.lock().await;
+    //     for _ in 0..5 {
+    //         if let Some(Err(e)) = sender.send_to(&victim_restore.to_bytes(), None) {
+    //             eprintln!("[!] restore victim: {e}");
+    //         }
+    //         if let Some(Err(e)) = sender.send_to(&gateway_restore_garp.to_bytes(), None) {
+    //             eprintln!("[!] restore gateway: {e}");
+    //         }
+    //         drop(sender);
+    //         tokio::time::sleep(Duration::from_millis(100)).await;
+    //         sender = self.sender.lock().await;
+    //     }
+
+    //     println!("[+] ARP caches restored for {}", target.victim_ip);
+    //     Ok(())
+    // }
 
     // async fn restore(
     //     &self,

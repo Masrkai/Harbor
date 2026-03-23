@@ -1,6 +1,8 @@
 pub mod check_interfaces;
 pub mod check_root;
 pub mod gateway;
+pub mod ip_range;
 pub mod logger;
 pub mod oui;
+pub mod shutdown;
 pub mod tc;
