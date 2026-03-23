@@ -1,0 +1,93 @@
+@startuml
+skinparam backgroundColor #FEFEFE
+skinparam componentStyle rectangle
+skinparam defaultFontName Monospaced
+skinparam ranksep 40
+skinparam nodesep 30
+
+title Harbor — Component Architecture
+
+' ── Top: Entry ───────────────────────────────────────────────
+package "CLI / Entry" #LightBlue {
+    [clap Args] as Args
+    [InterfaceSelector] as IfSel
+    [TargetSelector] as TgtSel
+    [main.rs\ngateway_mode.rs] as Main
+}
+
+' ── Middle-left: Network I/O ──────────────────────────────────
+package "Network I/O" #LightCoral {
+    [ArpScanner\nscan · passive_sniff\npre_wake · resolve_hosts] as Scanner
+    [DataLinkSender\nArc<Mutex<>>] as Sender
+    [DataLinkReceiver\nArc<Mutex<>>] as Receiver
+}
+
+' ── Middle-right: Host Management ────────────────────────────
+package "Host Management" #LightGray {
+    [HostTable\nIP + MAC index\nArc<RwLock<>>] as Table
+    [OUI Vendor Lookup] as OUI
+}
+
+' ── Middle: MITM Engine ───────────────────────────────────────
+package "MITM Engine" #LightYellow {
+    [SpooferEngine] as Spoofer
+    [PoisonLoop\nbidirectional · jittered] as Poison
+    [PacketForwarder\nspawn_blocking recv] as Forwarder
+}
+
+' ── Bottom: Traffic Control ───────────────────────────────────
+package "Traffic Control" #LightGreen {
+    [TcManager\nHTB + IFB + nft] as TC
+    [KernelState\nip_forward · rp_filter] as Kernel
+    [NftGate\nrpfilter-allow] as Nft
+}
+
+' ── Startup flow (top → down) ────────────────────────────────
+Args      --> Main
+Main      --> IfSel    : select interface
+Main      --> Scanner  : scan + sniff
+Scanner   --> Table    : insert DiscoveredHost
+Scanner   --> OUI      : lookup_vendor
+Main      --> TgtSel   : select targets
+Table     --> TgtSel   : display hosts
+
+' ── Shared I/O ───────────────────────────────────────────────
+Scanner   --> Sender   : get_sender()
+Scanner   --> Receiver : (internal)
+
+' ── MITM wiring ──────────────────────────────────────────────
+Main      --> Spoofer  : Start(SpoofTarget)
+Main      --> Forwarder: Enable(ForwardRule)
+Spoofer   --> Poison   : spawn tokio task
+Poison    --> Sender   : ArpPoison / ArpRestore
+Forwarder --> Receiver : recv loop
+Forwarder --> Sender   : relay_packet
+Forwarder --> Table    : lookup victim/gateway MACs
+
+' ── Traffic control ──────────────────────────────────────────
+Main      --> Kernel   : enable\n(ip_forward=0, rp_filter=0)
+Main      --> Nft      : install rpfilter-allow
+Main      --> TC       : init() · limit_host()
+TC        --> Kernel   : modprobe ifb
+
+' ── Shutdown (dashed) ────────────────────────────────────────
+Main      ..> Forwarder: DisableAll
+Main      ..> Spoofer  : StopAll
+Main      ..> TC       : cleanup()
+Main      ..> Kernel   : restore()
+Main      ..> Nft      : revoke()
+
+' ── Notes ────────────────────────────────────────────────────
+note bottom of Forwarder
+  ip_forward = 0
+  Userspace relay only.
+  Avoids duplicate packets.
+end note
+
+note bottom of TC
+  Subprocess: tc + nft.
+  harbor_mangle → fwmark.
+  IFB for ingress shaping.
+end note
+
+@enduml

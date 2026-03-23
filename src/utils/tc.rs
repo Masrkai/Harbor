@@ -79,7 +79,7 @@ const SLOT_PASSTHROUGH: u16 = 0xFFF;
 const SLOT_MIN: u16 = 2;
 const KERNEL_HZ: u64 = 100;
 const BURST_MIN_BYTES: u64 = 1_600;
-const NFT_TABLE: &str = "harbor_mangle";
+const NFT_TABLE: &str = "harbor";
 const NFT_CHAIN: &str = "FORWARD";
 
 #[derive(Debug)]
@@ -149,31 +149,69 @@ impl TcManager {
         // The previous per-victim fw filter approach was wrong because download
         // packets arrive at ingress BEFORE netfilter sets the mark.
         run_check(&[
-            "tc", "qdisc", "add", "dev", &self.interface,
-            "handle", "ffff:", "ingress",
+            "tc",
+            "qdisc",
+            "add",
+            "dev",
+            &self.interface,
+            "handle",
+            "ffff:",
+            "ingress",
         ])?;
         run_check(&[
-            "tc", "filter", "add", "dev", &self.interface,
-            "parent", "ffff:",
-            "protocol", "all",
-            "u32", "match", "u32", "0", "0",
-            "action", "connmark",
-            "action", "mirred", "egress", "redirect", "dev", IFB_DEV,
+            "tc",
+            "filter",
+            "add",
+            "dev",
+            &self.interface,
+            "parent",
+            "ffff:",
+            "protocol",
+            "all",
+            "u32",
+            "match",
+            "u32",
+            "0",
+            "0",
+            "action",
+            "connmark",
+            "action",
+            "mirred",
+            "egress",
+            "redirect",
+            "dev",
+            IFB_DEV,
         ])?;
 
         // HTB root on physical NIC (upload / egress)
         run_check(&[
-            "tc", "qdisc", "add", "dev", &self.interface,
-            "root", "handle", HANDLE_EGRESS, "htb",
-            "default", &format!("{:x}", SLOT_PASSTHROUGH),
+            "tc",
+            "qdisc",
+            "add",
+            "dev",
+            &self.interface,
+            "root",
+            "handle",
+            HANDLE_EGRESS,
+            "htb",
+            "default",
+            &format!("{:x}", SLOT_PASSTHROUGH),
         ])?;
         self.add_root_classes(&self.interface.clone(), HANDLE_EGRESS)?;
 
         // HTB root on IFB (download / redirected ingress)
         run_check(&[
-            "tc", "qdisc", "add", "dev", IFB_DEV,
-            "root", "handle", HANDLE_INGRESS, "htb",
-            "default", &format!("{:x}", SLOT_PASSTHROUGH),
+            "tc",
+            "qdisc",
+            "add",
+            "dev",
+            IFB_DEV,
+            "root",
+            "handle",
+            HANDLE_INGRESS,
+            "htb",
+            "default",
+            &format!("{:x}", SLOT_PASSTHROUGH),
         ])?;
         self.add_root_classes(IFB_DEV, HANDLE_INGRESS)?;
 
@@ -210,7 +248,10 @@ impl TcManager {
                 (ShapeMode::Limited(_), ShapeMode::Limited(new_kbps)) => {
                     self.update_rate_classes(existing.slot, new_kbps)?;
                     self.hosts.get_mut(&host_id).unwrap().mode = ShapeMode::Limited(new_kbps);
-                    println!("[*] tc: host {} ({}) updated → {} kbps", host_id, ip, new_kbps);
+                    println!(
+                        "[*] tc: host {} ({}) updated → {} kbps",
+                        host_id, ip, new_kbps
+                    );
                     return Ok(());
                 }
                 _ => {
@@ -295,14 +336,32 @@ impl TcManager {
         let pass_class = format!("{}:{:x}", major, SLOT_PASSTHROUGH);
 
         run_check(&[
-            "tc", "class", "add", "dev", dev,
-            "parent", handle, "classid", &root_class,
-            "htb", "rate", LINE_RATE,
+            "tc",
+            "class",
+            "add",
+            "dev",
+            dev,
+            "parent",
+            handle,
+            "classid",
+            &root_class,
+            "htb",
+            "rate",
+            LINE_RATE,
         ])?;
         run_check(&[
-            "tc", "class", "add", "dev", dev,
-            "parent", &root_class, "classid", &pass_class,
-            "htb", "rate", LINE_RATE,
+            "tc",
+            "class",
+            "add",
+            "dev",
+            dev,
+            "parent",
+            &root_class,
+            "classid",
+            &pass_class,
+            "htb",
+            "rate",
+            LINE_RATE,
         ])?;
         Ok(())
     }
@@ -324,7 +383,9 @@ impl TcManager {
         self.nft_rebuild_chain()?;
 
         match mode {
-            ShapeMode::Limited(k) => println!("[+] tc: host {} ({}) limited to {} kbps", host_id, ip, k),
+            ShapeMode::Limited(k) => {
+                println!("[+] tc: host {} ({}) limited to {} kbps", host_id, ip, k)
+            }
             ShapeMode::Blocked => println!("[+] tc: host {} ({}) BLOCKED", host_id, ip),
         }
         Ok(())
@@ -365,21 +426,52 @@ impl TcManager {
             let leaf_handle = format!("{:x}:", slot as u32 + 0x100);
 
             run_check(&[
-                "tc", "class", "add", "dev", dev,
-                "parent", &root_class, "classid", &classid,
-                "htb", "rate", &rate_str, "ceil", &rate_str, "burst", &burst,
+                "tc",
+                "class",
+                "add",
+                "dev",
+                dev,
+                "parent",
+                &root_class,
+                "classid",
+                &classid,
+                "htb",
+                "rate",
+                &rate_str,
+                "ceil",
+                &rate_str,
+                "burst",
+                &burst,
             ])?;
             run_check(&[
-                "tc", "qdisc", "add", "dev", dev,
-                "parent", &classid, "handle", &leaf_handle,
-                "sfq", "perturb", "10",
+                "tc",
+                "qdisc",
+                "add",
+                "dev",
+                dev,
+                "parent",
+                &classid,
+                "handle",
+                &leaf_handle,
+                "sfq",
+                "perturb",
+                "10",
             ])?;
             run_check(&[
-                "tc", "filter", "add", "dev", dev,
-                "parent", &format!("{}:0", major),
-                "protocol", "ip",
-                "handle", &slot_str, "fw",
-                "flowid", &classid,
+                "tc",
+                "filter",
+                "add",
+                "dev",
+                dev,
+                "parent",
+                &format!("{}:0", major),
+                "protocol",
+                "ip",
+                "handle",
+                &slot_str,
+                "fw",
+                "flowid",
+                &classid,
             ])?;
         }
 
@@ -404,21 +496,52 @@ impl TcManager {
             let leaf_handle = format!("{:x}:", slot as u32 + 0x200);
 
             run_check(&[
-                "tc", "class", "add", "dev", dev,
-                "parent", &root_class, "classid", &classid,
-                "htb", "rate", &rate_str, "ceil", &rate_str, "burst", &burst,
+                "tc",
+                "class",
+                "add",
+                "dev",
+                dev,
+                "parent",
+                &root_class,
+                "classid",
+                &classid,
+                "htb",
+                "rate",
+                &rate_str,
+                "ceil",
+                &rate_str,
+                "burst",
+                &burst,
             ])?;
             run_check(&[
-                "tc", "qdisc", "add", "dev", dev,
-                "parent", &classid, "handle", &leaf_handle,
-                "sfq", "perturb", "10",
+                "tc",
+                "qdisc",
+                "add",
+                "dev",
+                dev,
+                "parent",
+                &classid,
+                "handle",
+                &leaf_handle,
+                "sfq",
+                "perturb",
+                "10",
             ])?;
             run_check(&[
-                "tc", "filter", "add", "dev", dev,
-                "parent", &format!("{}:0", major),
-                "protocol", "ip",
-                "handle", &slot_str, "fw",
-                "flowid", &classid,
+                "tc",
+                "filter",
+                "add",
+                "dev",
+                dev,
+                "parent",
+                &format!("{}:0", major),
+                "protocol",
+                "ip",
+                "handle",
+                &slot_str,
+                "fw",
+                "flowid",
+                &classid,
             ])?;
         }
 
@@ -437,7 +560,17 @@ impl TcManager {
             let major = tree.trim_end_matches(':');
             let classid = format!("{}:{:x}", major, slot);
             let leaf_handle = format!("{:x}:", slot as u32 + 0x100);
-            let _ = run(&["tc", "qdisc", "del", "dev", dev, "parent", &classid, "handle", &leaf_handle]);
+            let _ = run(&[
+                "tc",
+                "qdisc",
+                "del",
+                "dev",
+                dev,
+                "parent",
+                &classid,
+                "handle",
+                &leaf_handle,
+            ]);
             let _ = run(&["tc", "class", "del", "dev", dev, "classid", &classid]);
         }
     }
@@ -455,9 +588,22 @@ impl TcManager {
             let classid = format!("{}:{:x}", major, slot);
 
             run_check(&[
-                "tc", "class", "change", "dev", dev,
-                "parent", &root_class, "classid", &classid,
-                "htb", "rate", &rate_str, "ceil", &rate_str, "burst", &burst,
+                "tc",
+                "class",
+                "change",
+                "dev",
+                dev,
+                "parent",
+                &root_class,
+                "classid",
+                &classid,
+                "htb",
+                "rate",
+                &rate_str,
+                "ceil",
+                &rate_str,
+                "burst",
+                &burst,
             ])?;
         }
         Ok(())
@@ -556,7 +702,10 @@ fn run(args: &[&str]) -> Result<String, Box<dyn std::error::Error>> {
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     } else {
-        Err(String::from_utf8_lossy(&out.stderr).trim().to_string().into())
+        Err(String::from_utf8_lossy(&out.stderr)
+            .trim()
+            .to_string()
+            .into())
     }
 }
 
@@ -583,11 +732,13 @@ fn nft_apply(ruleset: &str) -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("nft -f - spawn: {e}"))?;
 
     if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(ruleset.as_bytes())
+        stdin
+            .write_all(ruleset.as_bytes())
             .map_err(|e| format!("nft stdin write: {e}"))?;
     }
 
-    let out = child.wait_with_output()
+    let out = child
+        .wait_with_output()
         .map_err(|e| format!("nft -f - wait: {e}"))?;
 
     if out.status.success() {
@@ -597,7 +748,8 @@ fn nft_apply(ruleset: &str) -> Result<(), Box<dyn std::error::Error>> {
             "nft -f - failed: {}\nRuleset:\n{}",
             String::from_utf8_lossy(&out.stderr).trim(),
             ruleset,
-        ).into())
+        )
+        .into())
     }
 }
 
@@ -639,7 +791,9 @@ mod tests {
         assert!(b2 > b1);
     }
 
-    fn make() -> TcManager { TcManager::new("eth0") }
+    fn make() -> TcManager {
+        TcManager::new("eth0")
+    }
 
     #[test]
     fn test_alloc_slot_avoids_reserved() {
@@ -675,7 +829,12 @@ mod tests {
     #[test]
     fn test_current_kbps_limited() {
         let mut m = make();
-        insert(&mut m, 1, Ipv4Addr::new(10, 0, 0, 1), ShapeMode::Limited(2_048));
+        insert(
+            &mut m,
+            1,
+            Ipv4Addr::new(10, 0, 0, 1),
+            ShapeMode::Limited(2_048),
+        );
         assert_eq!(m.current_kbps(1), Some(2_048));
     }
 

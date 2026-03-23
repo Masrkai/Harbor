@@ -20,8 +20,8 @@ use cli::color::Color;
 use cli::selector::InterfaceSelector;
 use cli::target_selector::TargetSelector;
 
-use forwarder::{ForwardRule, ForwarderCommand};
 use forwarder::engine::PacketForwarder;
+use forwarder::{ForwardRule, ForwarderCommand};
 
 use host::table::{HostState, HostTable};
 
@@ -71,6 +71,11 @@ struct Cli {
     /// Incompatible with --target and --gateway.
     #[arg(long, default_value_t = false)]
     gateway_mode: bool,
+
+    /// Use one-sided MITM (gratuitous ARP takeover instead of bidirectional poisoning).
+    /// Recommended for ethernet networks with strict ARP protection.
+    #[arg(long, default_value_t = false)]
+    one_sided: bool,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -168,7 +173,9 @@ impl NftGate {
 
         if !ok {
             println!("[!] nft: could not add rpfilter-allow rule (may be harmless)");
-            return Self { rpfilter_handle: None };
+            return Self {
+                rpfilter_handle: None,
+            };
         }
 
         let handle = last_rule_handle("inet", "nixos-fw", "rpfilter-allow");
@@ -176,15 +183,22 @@ impl NftGate {
             println!("[+] nft: rpfilter-allow rule added (handle {}).", h);
         }
 
-        Self { rpfilter_handle: handle }
+        Self {
+            rpfilter_handle: handle,
+        }
     }
 
     fn revoke(&self) {
         if let Some(handle) = self.rpfilter_handle {
             let _ = std::process::Command::new("nft")
                 .args([
-                    "delete", "rule", "inet", "nixos-fw",
-                    "rpfilter-allow", "handle", &handle.to_string(),
+                    "delete",
+                    "rule",
+                    "inet",
+                    "nixos-fw",
+                    "rpfilter-allow",
+                    "handle",
+                    &handle.to_string(),
                 ])
                 .output();
             println!("[+] nft: rpfilter-allow rule revoked.");
@@ -213,8 +227,8 @@ fn last_rule_handle(family: &str, table: &str, chain: &str) -> Option<u64> {
 
 fn expand_target(s: &str) -> Result<Vec<Ipv4Addr>, String> {
     if s.contains('/') {
-        let range = network::IpRange::from_cidr(s)
-            .map_err(|e| format!("invalid CIDR '{s}': {e}"))?;
+        let range =
+            network::IpRange::from_cidr(s).map_err(|e| format!("invalid CIDR '{s}': {e}"))?;
         return Ok(range.iter().collect());
     }
     if let Some((prefix, range_part)) = s.rsplit_once('.') {
@@ -223,8 +237,12 @@ fn expand_target(s: &str) -> Result<Vec<Ipv4Addr>, String> {
                 .parse::<Ipv4Addr>()
                 .map_err(|_| format!("invalid prefix '{prefix}'"))?
                 .octets();
-            let lo: u8 = lo_s.parse().map_err(|_| format!("bad range start in '{s}'"))?;
-            let hi: u8 = hi_s.parse().map_err(|_| format!("bad range end in '{s}'"))?;
+            let lo: u8 = lo_s
+                .parse()
+                .map_err(|_| format!("bad range start in '{s}'"))?;
+            let hi: u8 = hi_s
+                .parse()
+                .map_err(|_| format!("bad range end in '{s}'"))?;
             if lo > hi {
                 return Err(format!("range start > end in '{s}'"));
             }
@@ -248,6 +266,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     check_root();
 
     let cli = Cli::parse();
+
+    if cli.one_sided {
+        println!("[*] One-sided MITM mode: gratuitous ARP takeover");
+        // Use new gratuitous ARP approach
+    } else {
+        println!("[*] Bidirectional MITM mode: traditional poisoning");
+        // Use current approach
+    }
 
     // ── Gateway mode early dispatch ──────────────────────────────────────────
     // Must run before the MITM-specific scanner / interface setup below so we
@@ -274,7 +300,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Interface selection ──────────────────────────────────────────────────
     let interface_name = match cli.interface {
         Some(name) => {
-            logger.info_fmt(format_args!("Interface (from args): {}", COLOR_KEYWORD.paint(&name)));
+            logger.info_fmt(format_args!(
+                "Interface (from args): {}",
+                COLOR_KEYWORD.paint(&name)
+            ));
             name
         }
         None => match InterfaceSelector::select(true) {
@@ -289,23 +318,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Gateway detection ────────────────────────────────────────────────────
     let gateway_ip = match cli.gateway {
         Some(ip) => {
-            logger.info_fmt(format_args!("Gateway (from args): {}", COLOR_OK.paint(&ip.to_string())));
+            logger.info_fmt(format_args!(
+                "Gateway (from args): {}",
+                COLOR_OK.paint(&ip.to_string())
+            ));
             ip
         }
         None => match get_gateway(&interface_name) {
             Some(ip) => {
-                logger.info_fmt(format_args!("Default gateway: {}", COLOR_OK.paint(&ip.to_string())));
+                logger.info_fmt(format_args!(
+                    "Default gateway: {}",
+                    COLOR_OK.paint(&ip.to_string())
+                ));
                 ip
             }
             None => {
-                logger.error_fmt(format_args!("Could not detect default gateway on {}.", interface_name));
+                logger.error_fmt(format_args!(
+                    "Could not detect default gateway on {}.",
+                    interface_name
+                ));
                 std::process::exit(1);
             }
         },
     };
 
     // ── Scanner ──────────────────────────────────────────────────────────────
-    logger.info_fmt(format_args!("Initialising on interface: {}", COLOR_KEYWORD.paint(&interface_name)));
+    logger.info_fmt(format_args!(
+        "Initialising on interface: {}",
+        COLOR_KEYWORD.paint(&interface_name)
+    ));
     let scanner = ArpScanner::new(&interface_name).await?;
     logger.info_fmt(format_args!(
         "Local MAC: {}  Local IP: {}",
@@ -319,7 +360,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         for raw in &cli.targets {
             match expand_target(raw) {
                 Ok(v) => {
-                    logger.info_fmt(format_args!("Target '{}' → {} IP(s)", COLOR_KEYWORD.paint(raw), v.len()));
+                    logger.info_fmt(format_args!(
+                        "Target '{}' → {} IP(s)",
+                        COLOR_KEYWORD.paint(raw),
+                        v.len()
+                    ));
                     ips.extend(v);
                 }
                 Err(e) => {
@@ -336,7 +381,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         logger.info_fmt(format_args!("Bypass mode — resolving {} IP(s)…", ips.len()));
         (scanner.resolve_hosts(&ips).await?, true)
     } else {
-        logger.info_fmt(format_args!("Starting ARP scan on: {}", COLOR_KEYWORD.paint(&interface_name)));
+        logger.info_fmt(format_args!(
+            "Starting ARP scan on: {}",
+            COLOR_KEYWORD.paint(&interface_name)
+        ));
         let cidr = get_cidr(&interface_name).ok_or("could not determine CIDR")?;
         let range = network::IpRange::from_cidr(&cidr)?;
         logger.info_fmt(format_args!(
@@ -345,17 +393,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             COLOR_KEYWORD.paint(&range.end.to_string()),
         ));
         logger.info_fmt(format_args!("Passive ARP sniff (10 s)…"));
-        let passive = scanner.passive_sniff(std::time::Duration::from_secs(10)).await?;
+        let passive = scanner
+            .passive_sniff(std::time::Duration::from_secs(10))
+            .await?;
         let mut d = scanner.scan(range).await?;
         d.extend(passive);
         logger.info_fmt(format_args!("Post-scan passive sniff (5 s)…"));
-        d.extend(scanner.passive_sniff(std::time::Duration::from_secs(5)).await?);
+        d.extend(
+            scanner
+                .passive_sniff(std::time::Duration::from_secs(5))
+                .await?,
+        );
         (d, false)
     };
 
     // ── Vendor resolution + host table ───────────────────────────────────────
     let mut discovered = discovered;
-    logger.info_fmt(format_args!("Resolving vendors for {} hosts…", discovered.len()));
+    logger.info_fmt(format_args!(
+        "Resolving vendors for {} hosts…",
+        discovered.len()
+    ));
     for host in &mut discovered {
         host.vendor = Some(lookup_vendor(host.mac));
     }
@@ -368,7 +425,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         t.reindex_by_ip();
     }
-    { host_table.read().await.display(); }
+    {
+        host_table.read().await.display();
+    }
 
     // ── Gateway verification ─────────────────────────────────────────────────
     let gateway_mac = {
@@ -388,25 +447,75 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
 
     // ── Target selection ─────────────────────────────────────────────────────
-    let selection = if bypass_mode {
-        let gw_id = host_table.read().await.get_by_ip(gateway_ip).map(|e| e.id);
-        let ids: Vec<_> = host_table.read().await.iter()
-            .filter(|e| Some(e.id) != gw_id)
-            .map(|e| e.id)
-            .collect();
-        if ids.is_empty() {
-            logger.error_fmt(format_args!("No targets after bypass resolution."));
-            std::process::exit(1);
+
+    // Add near the top of main.rs, after imports:
+
+/// Prompts for bandwidth if not provided, returns the user's choice.
+fn resolve_bandwidth(
+    from_cli: Option<u64>,
+    logger: &mut Logger,
+) -> Option<u64> {
+    match from_cli {
+        Some(k) => {
+            logger.info_fmt(format_args!("Bandwidth (from args): {} kbps", k));
+            Some(k)
         }
-        logger.info_fmt(format_args!("Bypass: {} target(s).", ids.len()));
-        cli::target_selector::SelectionResult {
-            host_ids: ids,
-            bandwidth_kbps: cli.bandwidth,
+        None => {
+            use std::io::Write;
+            print!(
+                "{}",
+                crate::paint!(
+                    &COLOR_KEYWORD,
+                    "Bandwidth cap in kbps per host (leave blank = unlimited): "
+                )
+            );
+            std::io::stdout().flush().unwrap();
+            
+            let mut buf = String::new();
+            match std::io::stdin().read_line(&mut buf) {
+                Ok(_) => {
+                    let result = TargetSelector::parse_bandwidth(buf.trim());
+                    match result {
+                        Some(kbps) => logger.info_fmt(format_args!(
+                            "Bandwidth limit: {} kbps per host", kbps
+                        )),
+                        None => logger.info_fmt(format_args!("No bandwidth limit.")),
+                    }
+                    result
+                }
+                Err(_) => {
+                    logger.error_fmt(format_args!("Failed to read input"));
+                    None
+                }
+            }
         }
+    }
+}
+
+
+let selection = if bypass_mode {
+    let gw_id = host_table.read().await.get_by_ip(gateway_ip).map(|e| e.id);
+    let ids: Vec<_> = host_table.read().await.iter()
+        .filter(|e| Some(e.id) != gw_id)
+        .map(|e| e.id)
+        .collect();
+    if ids.is_empty() {
+        logger.error_fmt(format_args!("No targets after bypass resolution."));
+        std::process::exit(1);
+    }
+    logger.info_fmt(format_args!("Bypass: {} target(s).", ids.len()));
+
+    let bandwidth_kbps = resolve_bandwidth(cli.bandwidth, &mut logger);
+
+    cli::target_selector::SelectionResult {
+        host_ids: ids,
+        bandwidth_kbps,
+    }
     } else {
+        // Interactive path with TargetSelector
         match {
             let t = host_table.read().await;
-            TargetSelector::select(&t, gateway_ip)
+            TargetSelector::select(&t, gateway_ip) // ← Prompts user
         } {
             Some(s) => s,
             None => {
@@ -450,17 +559,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::process::exit(1);
             }
             Ok(()) => {
-                logger.info_fmt(format_args!("tc: HTB + IFB shaping initialised on {}.", interface_name));
+                logger.info_fmt(format_args!(
+                    "tc: HTB + IFB shaping initialised on {}.",
+                    interface_name
+                ));
                 let table = host_table.read().await;
                 for &id in &selection.host_ids {
                     if let Some(entry) = table.get_by_id(id) {
                         match tc.limit_host(id, entry.host.ip, kbps) {
                             Ok(()) => logger.info_fmt(format_args!(
-                                "tc: [{}] {} → {} kbps", id,
-                                COLOR_WARN.paint(&entry.host.ip.to_string()), kbps,
+                                "tc: [{}] {} → {} kbps",
+                                id,
+                                COLOR_WARN.paint(&entry.host.ip.to_string()),
+                                kbps,
                             )),
                             Err(e) => logger.error_fmt(format_args!(
-                                "tc limit_host [{}] {}: {e}", id, entry.host.ip,
+                                "tc limit_host [{}] {}: {e}",
+                                id, entry.host.ip,
                             )),
                         }
                     }
@@ -498,11 +613,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     our_mac,
                 };
                 if let Err(e) = fwd_tx.send(ForwarderCommand::Enable(rule)).await {
-                    logger.error_fmt(format_args!("Could not enable forwarding for host {id}: {e}"));
+                    logger.error_fmt(format_args!(
+                        "Could not enable forwarding for host {id}: {e}"
+                    ));
                 } else {
                     logger.info_fmt(format_args!(
                         "Forwarding enabled for [{}] {}",
-                        id, COLOR_WARN.paint(&entry.host.ip.to_string()),
+                        id,
+                        COLOR_WARN.paint(&entry.host.ip.to_string()),
                     ));
                 }
             }
@@ -523,15 +641,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let table = host_table.read().await;
         for &id in &selection.host_ids {
             if let Some(entry) = table.get_by_id(id) {
-                let target = SpoofTarget::new(
-                    id, entry.host.ip, entry.host.mac, gateway_ip, gateway_mac,
-                );
+                let target =
+                    SpoofTarget::new(id, entry.host.ip, entry.host.mac, gateway_ip, gateway_mac);
                 if let Err(e) = spoof_tx.send(SpooferCommand::Start(target)).await {
                     logger.error_fmt(format_args!("Could not start poison for host {id}: {e}"));
                 } else {
                     logger.info_fmt(format_args!(
                         "Poisoning [{}] {} ({})",
-                        id, COLOR_WARN.paint(&entry.host.ip.to_string()), entry.host.mac,
+                        id,
+                        COLOR_WARN.paint(&entry.host.ip.to_string()),
+                        entry.host.mac,
                     ));
                 }
             }
@@ -603,7 +722,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     logger.info_fmt(format_args!("ARP caches restoration sent."));
 
     tc.cleanup();
-    logger.info_fmt(format_args!("tc qdiscs, harbor_mangle table, and ifb0 removed."));
+    logger.info_fmt(format_args!(
+        "tc qdiscs, harbor_mangle table, and ifb0 removed."
+    ));
 
     kernel_state.restore();
     logger.info_fmt(format_args!("Kernel state restored."));

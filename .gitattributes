@@ -1,0 +1,2 @@
+*.nix linguist-detectable=true
+*.sh linguist-detectable=true
