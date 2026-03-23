@@ -43,9 +43,9 @@ use crate::cli::color::Color;
 use crate::cli::selector::InterfaceSelector;
 use crate::cli::target_selector::{SelectionResult, TargetSelector};
 use crate::host::table::HostTable;
+use crate::network::IpRange;
 use crate::network::calculator::get_cidr;
 use crate::network::scanner::ArpScanner;
-use crate::network::IpRange;
 use crate::utils::logger::Logger;
 use crate::utils::oui::lookup_vendor;
 use crate::utils::tc::TcManager;
@@ -115,14 +115,10 @@ pub async fn run(cfg: GatewayModeConfig) -> Result<(), Box<dyn std::error::Error
     // Two paths: bypass (--target given) or full scan.
     let (discovered, bypass_mode) = if !cfg.targets.is_empty() {
         let ips = expand_targets(&cfg.targets, &mut logger);
-        logger.info_fmt(format_args!(
-            "Bypass mode — resolving {} IP(s)…",
-            ips.len()
-        ));
+        logger.info_fmt(format_args!("Bypass mode — resolving {} IP(s)…", ips.len()));
         (scanner.resolve_hosts(&ips).await?, true)
     } else {
-        let cidr = get_cidr(&interface_name)
-            .ok_or("could not determine CIDR for interface")?;
+        let cidr = get_cidr(&interface_name).ok_or("could not determine CIDR for interface")?;
         let range = IpRange::from_cidr(&cidr)?;
         logger.info_fmt(format_args!(
             "Scanning {} → {}",
@@ -270,8 +266,7 @@ pub async fn run(cfg: GatewayModeConfig) -> Result<(), Box<dyn std::error::Error
                     )),
                     Err(e) => logger.error_fmt(format_args!(
                         "tc limit_host [{}] {}: {e}",
-                        id,
-                        entry.host.ip,
+                        id, entry.host.ip,
                     )),
                 }
             }
@@ -382,8 +377,7 @@ fn expand_targets(raw_targets: &[String], logger: &mut Logger) -> Vec<Ipv4Addr> 
 
 fn expand_one(s: &str) -> Result<Vec<Ipv4Addr>, String> {
     if s.contains('/') {
-        let range = IpRange::from_cidr(s)
-            .map_err(|e| format!("invalid CIDR '{s}': {e}"))?;
+        let range = IpRange::from_cidr(s).map_err(|e| format!("invalid CIDR '{s}': {e}"))?;
         return Ok(range.iter().collect());
     }
     if let Some((prefix, range_part)) = s.rsplit_once('.') {
@@ -392,8 +386,12 @@ fn expand_one(s: &str) -> Result<Vec<Ipv4Addr>, String> {
                 .parse::<Ipv4Addr>()
                 .map_err(|_| format!("invalid prefix '{prefix}'"))?
                 .octets();
-            let lo: u8 = lo_s.parse().map_err(|_| format!("bad range start in '{s}'"))?;
-            let hi: u8 = hi_s.parse().map_err(|_| format!("bad range end in '{s}'"))?;
+            let lo: u8 = lo_s
+                .parse()
+                .map_err(|_| format!("bad range start in '{s}'"))?;
+            let hi: u8 = hi_s
+                .parse()
+                .map_err(|_| format!("bad range end in '{s}'"))?;
             if lo > hi {
                 return Err(format!("range start > end in '{s}'"));
             }

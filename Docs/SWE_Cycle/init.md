@@ -219,19 +219,3 @@ pub struct BandwidthLimiter {
 | **ARP State** | Dictionary mutations during iteration | `HostState` enum + `match` exhaustiveness |
 | **Resource Cleanup** | `__del__` unreliable | `Drop` trait guarantees tc/nftables cleanup |
 
----
-
-## Development Checklist
-
-- [ ] **Week 1:** Set up `pnet` raw sockets, ARP packet construction
-- [ ] **Week 2:** Implement `scan` with `tokio::net::lookup_host`
-- [ ] **Week 3:** Bidirectional ARP spoofing with `tokio::select!`
-- [ ] **Week 4:** Packet forwarding with `tokio::io::copy`
-- [ ] **Week 5:** Netlink integration for `tc` (test with `tc show`)
-- [ ] **Week 6:** HTB class hierarchy, filter implementation
-- [ ] **Week 7:** `rustyline` shell, command parsing with `clap`
-- [ ] **Week 8:** `ratatui` real-time bandwidth display
-- [ ] **Week 9:** Error injection tests, ARP inspection evasion
-- [ ] **Week 10:** IPv6 NDP research (future work)
-
-Want me to elaborate on the `tc` HTB hierarchy design or the async poison loop implementation?
