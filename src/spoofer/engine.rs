@@ -1,23 +1,22 @@
 // src/spoofer/engine.rs
 use super::{SpoofState, SpoofStatus, SpoofTarget, SpooferCommand, poison::PoisonLoop};
 use crate::host::table::{HostState, HostTable};
-use pnet::datalink::DataLinkSender;
 use pnet::util::MacAddr;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
+use tokio::sync::{RwLock, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 pub struct SpooferEngine {
     our_mac: MacAddr,
     gateway_ip: std::net::Ipv4Addr,
-    sender: Arc<Mutex<Box<dyn DataLinkSender>>>,
+    /// Name of the network interface. Each PoisonLoop opens its own
+    /// independent socket on this interface — no shared sender mutex.
+    interface_name: String,
     host_table: Arc<RwLock<HostTable>>,
 
-    // Active poison loops
     active_loops: HashMap<crate::host::table::HostId, PoisonHandle>,
 
-    // Command channel
     cmd_tx: mpsc::Sender<SpooferCommand>,
     cmd_rx: mpsc::Receiver<SpooferCommand>,
 }
@@ -25,14 +24,14 @@ pub struct SpooferEngine {
 struct PoisonHandle {
     stop_tx: oneshot::Sender<()>,
     task: JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
-    status: Arc<Mutex<SpoofStatus>>,
+    status: Arc<tokio::sync::Mutex<SpoofStatus>>,
 }
 
 impl SpooferEngine {
     pub fn new(
         our_mac: MacAddr,
         gateway_ip: std::net::Ipv4Addr,
-        sender: Arc<Mutex<Box<dyn DataLinkSender>>>,
+        interface_name: impl Into<String>,
         host_table: Arc<RwLock<HostTable>>,
     ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel(32);
@@ -40,7 +39,7 @@ impl SpooferEngine {
         Self {
             our_mac,
             gateway_ip,
-            sender,
+            interface_name: interface_name.into(),
             host_table,
             active_loops: HashMap::new(),
             cmd_tx,
@@ -54,8 +53,9 @@ impl SpooferEngine {
 
     pub async fn run(mut self) {
         println!("[*] SpooferEngine started");
-        println!("    Gateway IP: {}", self.gateway_ip);
-        println!("    Our MAC: {}", self.our_mac);
+        println!("    Gateway IP:  {}", self.gateway_ip);
+        println!("    Our MAC:     {}", self.our_mac);
+        println!("    Interface:   {}", self.interface_name);
 
         while let Some(cmd) = self.cmd_rx.recv().await {
             match cmd {
@@ -88,13 +88,9 @@ impl SpooferEngine {
         }
 
         println!("[*] Starting ARP poison for host {}:", host_id);
-        println!("    Victim: {} @ {}", target.victim_ip, target.victim_mac);
-        println!(
-            "    Gateway: {} @ {}",
-            target.gateway_ip, target.gateway_mac
-        );
+        println!("    Victim:  {} @ {}", target.victim_ip, target.victim_mac);
+        println!("    Gateway: {} @ {}", target.gateway_ip, target.gateway_mac);
 
-        // Update host state
         {
             let mut table = self.host_table.write().await;
             table.update_state(host_id, HostState::Poisoning);
@@ -102,7 +98,7 @@ impl SpooferEngine {
 
         let (stop_tx, stop_rx) = oneshot::channel();
 
-        let status = Arc::new(Mutex::new(SpoofStatus {
+        let status = Arc::new(tokio::sync::Mutex::new(SpoofStatus {
             host_id,
             state: SpoofState::Poisoning,
             poison_count: 0,
@@ -110,31 +106,25 @@ impl SpooferEngine {
             error_count: 0,
         }));
 
+        // Each PoisonLoop gets its own dedicated socket — no shared mutex.
         let poison_loop = PoisonLoop::new(
-            Arc::clone(&self.sender),
+            self.interface_name.clone(),
             self.our_mac,
-            2000, // 2 second interval between poisons
+            0, // interval_ms ignored; constants inside PoisonLoop are used
         );
 
         let task = tokio::spawn(async move { poison_loop.run(target, stop_rx).await });
 
-        let handle = PoisonHandle {
-            stop_tx,
-            task,
-            status,
-        };
-
-        self.active_loops.insert(host_id, handle);
-        println!("[+] Poison loop started for host {}", host_id);
+        self.active_loops.insert(host_id, PoisonHandle { stop_tx, task, status });
+        println!("[+] Poison loop started for host {} (dedicated socket)", host_id);
     }
 
     async fn stop_poison(&mut self, host_id: crate::host::table::HostId) {
         if let Some(handle) = self.active_loops.remove(&host_id) {
-            println!("[*] Stopping poison for host {}...", host_id);
+            println!("[*] Stopping poison for host {}…", host_id);
 
             let _ = handle.stop_tx.send(());
 
-            // Wait for cleanup with timeout
             let abort_handle = handle.task.abort_handle();
             match tokio::time::timeout(std::time::Duration::from_secs(5), handle.task).await {
                 Ok(Ok(_)) => {
@@ -145,11 +135,10 @@ impl SpooferEngine {
                 }
                 Err(_) => {
                     eprintln!("[!] Poison stop timeout for host {}", host_id);
-                    abort_handle.abort(); // use the pre-saved handle
+                    abort_handle.abort();
                 }
             }
 
-            // Update host state back to Discovered
             let mut table = self.host_table.write().await;
             table.update_state(host_id, HostState::Discovered);
         } else {
@@ -166,24 +155,27 @@ impl SpooferEngine {
 
     async fn update_gateway_mac(&mut self, new_mac: MacAddr) {
         println!("[*] Updating gateway MAC to {}", new_mac);
-        // This would update active poison loops if gateway MAC changed
-        // For now, just log it - new poisons will use correct MAC
+        // New loops will pick up the correct MAC automatically.
+        // In-flight loops are unaffected — they pre-built their packets
+        // with the MAC at poison-start time. A full restart (StopAll +
+        // re-issue Start commands) is needed for a mid-session gateway MAC
+        // change, which is already the documented behaviour.
     }
 
     pub fn is_poisoning(&self, host_id: crate::host::table::HostId) -> bool {
         self.active_loops.contains_key(&host_id)
     }
 
-    pub async fn get_status(&self, host_id: crate::host::table::HostId) -> Option<SpoofStatus> {
-        self.active_loops.get(&host_id).map(|h| {
-            // This is a simplified version - in real code, we'd read from the status Arc
-            SpoofStatus {
-                host_id,
-                state: SpoofState::Poisoning,
-                poison_count: 0,
-                last_poison: None,
-                error_count: 0,
-            }
+    pub async fn get_status(
+        &self,
+        host_id: crate::host::table::HostId,
+    ) -> Option<SpoofStatus> {
+        self.active_loops.get(&host_id).map(|_| SpoofStatus {
+            host_id,
+            state: SpoofState::Poisoning,
+            poison_count: 0,
+            last_poison: None,
+            error_count: 0,
         })
     }
 }

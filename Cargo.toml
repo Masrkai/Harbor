@@ -11,4 +11,4 @@ rtnetlink = "0.20.0"
 oui-data = "0.2.1"
 clap = { version = "4", features = ["derive"] }
 ctrlc = { version = "3", features = ["termination"] }
-libc = "0.2"
+# libc = "0.2"

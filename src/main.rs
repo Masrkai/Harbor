@@ -33,9 +33,9 @@ use utils::logger::Logger;
 use utils::oui::lookup_vendor;
 use utils::tc::TcManager;
 
+const COLOR_OK:      Color = Color::from_hex(b"#50C878");
+const COLOR_WARN:    Color = Color::from_hex(b"#FFB347");
 const COLOR_KEYWORD: Color = Color::from_hex(b"#C792EA");
-const COLOR_OK: Color = Color::from_hex(b"#50C878");
-const COLOR_WARN: Color = Color::from_hex(b"#FFB347");
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CLI
@@ -527,7 +527,6 @@ let selection = if bypass_mode {
 
     // ── Grab what we need from the scanner then drop it ──────────────────────
     let our_mac = scanner.local_mac();
-    let spoof_sender = scanner.get_sender();
     drop(scanner);
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -628,12 +627,8 @@ let selection = if bypass_mode {
     }
 
     // ── Spoofer ──────────────────────────────────────────────────────────────
-    let spoofer = SpooferEngine::new(
-        our_mac,
-        gateway_ip,
-        Arc::clone(&spoof_sender),
-        Arc::clone(&host_table),
-    );
+    let spoofer = SpooferEngine::new(our_mac, gateway_ip, &interface_name,Arc::clone(&host_table));
+
     let spoof_tx = spoofer.command_sender();
     tokio::spawn(async move { spoofer.run().await });
 
