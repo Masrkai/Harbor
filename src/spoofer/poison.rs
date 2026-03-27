@@ -1,29 +1,6 @@
 // src/spoofer/poison.rs
 //
 // ─────────────────────────────────────────────────────────────────────────────
-// Why the old 2-second interval was wrong
-// ─────────────────────────────────────────────────────────────────────────────
-//
-// Sending poison ARP replies every 2 seconds produces:
-//   • 1 packet/2s to the victim   (acceptable)
-//   • 1 packet/2s to the gateway  (the problem)
-//
-// Consumer/SOHO routers have ARP storm protection.  When they see the same
-// MAC hammering them with unsolicited ARP replies at high frequency they:
-//   1. Rate-limit or drop all traffic from that MAC for a cooldown window
-//   2. Sometimes write a semi-permanent block that outlasts reboots because
-//      it lives in the router's state, not the attacker's
-//
-// The fix: use separate, much longer intervals for victim vs gateway.
-//
-//   VICTIM_INTERVAL_MS  = 4_000  (4 s)
-//   GATEWAY_INTERVAL_MS = 8_000  (8 s)
-//
-// Both intervals have ±20% random jitter added. Uniform-interval ARP
-// streams are a textbook IDS signature; jitter makes the traffic pattern
-// look like organic ARP behaviour.
-//
-// ─────────────────────────────────────────────────────────────────────────────
 // Why each PoisonLoop owns its own socket
 // ─────────────────────────────────────────────────────────────────────────────
 //
@@ -157,11 +134,11 @@ impl PoisonLoop {
                     }
                 }
 
-                _ = &mut stop_rx => {
-                    println!("[*] stopping poison for host {}", target.host_id);
-                    restore(&mut *sender, &target);
-                    return Ok(());
-                }
+                // _ = &mut stop_rx => {
+                //     println!("[*] stopping poison for host {}", target.host_id);
+                //     restore(&mut *sender, &target);
+                //     return Ok(());
+                // }
             }
         }
     }
